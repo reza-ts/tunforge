@@ -1,0 +1,1859 @@
+#!/usr/bin/env bash
+# tunforge - whiptail TUI + CLI dispatcher.
+#
+# Usage:
+#   tunforge                       # interactive TUI
+#   tunforge connect <profile>     # CLI: connect a profile
+#   tunforge disconnect            # CLI: tear everything down
+#   tunforge status                # CLI: print status
+#   tunforge list                  # CLI: list profiles
+#   tunforge logs                  # alias for tunforge-logs
+#   tunforge doctor                # health check + repair offer
+
+# shellcheck shell=bash disable=SC2155
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+TUNFORGE_LIB="${TUNFORGE_LIB:-/usr/local/lib/tunforge}"
+# shellcheck disable=SC1091
+source "$TUNFORGE_LIB/core.sh"
+
+_check_whiptail() {
+    command -v whiptail >/dev/null 2>&1 \
+        || die "whiptail not installed (apt install whiptail)"
+}
+
+# ---------------------------------------------------------------------------
+# Health check (used at TUI launch and via `tunforge doctor`)
+# ---------------------------------------------------------------------------
+# Returns 0 if state matches reality, 1 otherwise. Sets HEALTH_REPORT.
+HEALTH_REPORT=""
+_health_check() {
+    HEALTH_REPORT=""
+    local active iface fail=0
+    active="$(state_get_active)"
+    iface="$(state_get_iface)"
+
+    if [[ "$active" == "none" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "${TUNFORGE_PROFILES_DIR}/${active}.profile" ]]; then
+        HEALTH_REPORT+="active profile '$active' has no profile file\n"; fail=1
+    fi
+    if [[ -n "$iface" ]] && ! ip link show "$iface" >/dev/null 2>&1; then
+        HEALTH_REPORT+="active iface '$iface' is missing (tunnel went down?)\n"; fail=1
+    fi
+
+    if [[ "$active" != "none" ]] && [[ -f "${TUNFORGE_PROFILES_DIR}/${active}.profile" ]]; then
+        load_profile "$active" 2>/dev/null || true
+        if [[ "${P_TYPE:-}" != "direct" ]] && [[ "${P_KILL_SWITCH:-yes}" == "yes" ]]; then
+            if ! nft list table inet tunforge >/dev/null 2>&1; then
+                HEALTH_REPORT+="kill switch missing while non-direct profile is active\n"; fail=1
+            fi
+        fi
+    fi
+
+    return "$fail"
+}
+
+# ---------------------------------------------------------------------------
+# CLI subcommands
+# ---------------------------------------------------------------------------
+cli_connect() {
+    core_connect "$1"
+    echo "OK: profile '$1' active"
+    core_status
+}
+
+cli_disconnect() {
+    core_disconnect
+    echo "OK: disconnected (direct mode)"
+}
+
+cli_status() {
+    core_status
+}
+
+cli_list() {
+    local p
+    while IFS= read -r p; do
+        local desc="" country=""
+        local f="${TUNFORGE_PROFILES_DIR}/${p}.profile"
+        if [[ -f "$f" ]]; then
+            desc="$(awk -F= '/^[[:space:]]*DESC[[:space:]]*=/ {sub(/^[[:space:]]*DESC[[:space:]]*=/,"");gsub(/"/,"");print;exit}' "$f")"
+        fi
+        country="$(_profile_country "$p")"
+        printf '%-20s  %-14s  %s\n' "$p" "$country" "$desc"
+    done < <(list_profiles)
+}
+
+_profile_value() {
+    local profile="$1" key_re="$2" f="${TUNFORGE_PROFILES_DIR}/${profile}.profile"
+    [[ -f "$f" ]] || return 0
+    awk -F= -v re="$key_re" '
+        $0 ~ "^[[:space:]]*(" re ")[[:space:]]*=" {
+            sub(/^[^=]*=/, "")
+            gsub(/^["'"'"']|["'"'"']$/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$f" 2>/dev/null
+}
+
+_country_name_from_code() {
+    local code="${1,,}"
+    code="${code//[^a-z]/}"
+    case "$code" in
+        ae) echo "UAE" ;; ar) echo "Argentina" ;; au) echo "Australia" ;; at) echo "Austria" ;;
+        be) echo "Belgium" ;; br) echo "Brazil" ;; ca) echo "Canada" ;; ch) echo "Switzerland" ;;
+        cn) echo "China" ;; de) echo "Germany" ;; dk) echo "Denmark" ;; es) echo "Spain" ;;
+        fi) echo "Finland" ;; fr) echo "France" ;; gb|uk) echo "United Kingdom" ;;
+        hk) echo "Hong Kong" ;; ie) echo "Ireland" ;; il) echo "Israel" ;; in) echo "India" ;;
+        ir) echo "Iran" ;; it) echo "Italy" ;; jp) echo "Japan" ;; kr) echo "South Korea" ;;
+        nl) echo "Netherlands" ;; no) echo "Norway" ;; pl) echo "Poland" ;; ro) echo "Romania" ;;
+        ru) echo "Russia" ;; se) echo "Sweden" ;; sg) echo "Singapore" ;; tr) echo "Turkey" ;;
+        us|usa) echo "United States" ;;
+        *) return 1 ;;
+    esac
+}
+
+_profile_country() {
+    local profile="$1" explicit cached desc cfg base token
+    explicit="$(_profile_value "$profile" 'COUNTRY|COUNTRY_CODE|LOCATION')"
+    if [[ -n "$explicit" ]]; then
+        _country_name_from_code "$explicit" 2>/dev/null || printf '%s\n' "$explicit"
+        return
+    fi
+    if cached="$(country_cache_get "$profile" 2>/dev/null)"; then
+        printf '%s\n' "$cached"
+        return
+    fi
+    desc="$(_profile_value "$profile" 'DESC')"
+    case "${desc,,}" in
+        *germany*) echo "Germany"; return ;;
+        *netherlands*|*holland*) echo "Netherlands"; return ;;
+        *japan*) echo "Japan"; return ;;
+        *finland*) echo "Finland"; return ;;
+        *france*) echo "France"; return ;;
+        *turkey*) echo "Turkey"; return ;;
+        *united\ states*|*usa*) echo "United States"; return ;;
+        *united\ kingdom*|*uk*) echo "United Kingdom"; return ;;
+    esac
+    cfg="$(_profile_value "$profile" 'CONFIG')"
+    base="$(basename "${cfg:-$profile}")"
+    for token in "$profile" "$base"; do
+        if [[ "${token,,}" =~ (^|[-_.])([a-z]{2})([0-9]+|[-_.]|$) ]]; then
+            _country_name_from_code "${BASH_REMATCH[2]}" 2>/dev/null && return
+        fi
+    done
+    echo "Unknown"
+}
+
+cli_last_log() {
+    local log="${TUNFORGE_LAST_LOG:-/run/tunforge/connect-last.log}"
+    if [[ ! -s "$log" ]]; then
+        echo "no connect transcript yet (no $log)" >&2
+        return 1
+    fi
+    cat "$log"
+}
+
+_openvpn_auth_file_for() {
+    local profile="$1"
+    printf '%s/openvpn/%s.auth\n' "$TUNFORGE_AUTH_DIR" "$profile"
+}
+
+_require_openvpn_profile() {
+    local profile="$1"
+    load_profile "$profile"
+    [[ "$P_TYPE" == "openvpn" ]] || die "profile '$profile' is TYPE=$P_TYPE, not openvpn"
+}
+
+cli_openvpn_auth() {
+    local sub="${1:-status}"; shift || true
+    case "$sub" in
+        set|save)
+            require_root
+            local profile="${1:-}"; shift || true
+            [[ -n "$profile" ]] || die "usage: tunforge openvpn-auth set <profile> [username]"
+            _require_openvpn_profile "$profile"
+            local user="${1:-}" pass pass2 authf
+            if [[ -z "$user" ]]; then
+                read -r -p "OpenVPN username for '$profile': " user
+            fi
+            [[ -n "$user" ]] || die "username cannot be empty"
+            read -r -s -p "OpenVPN password for '$profile': " pass; echo
+            read -r -s -p "Repeat password: " pass2; echo
+            [[ "$pass" == "$pass2" ]] || die "passwords do not match"
+            authf="$(_openvpn_auth_file_for "$profile")"
+            install -d -m 0700 "$(dirname "$authf")"
+            {
+                printf '%s\n' "$user"
+                printf '%s\n' "$pass"
+            } > "${authf}.tmp"
+            chmod 0600 "${authf}.tmp"
+            mv -f "${authf}.tmp" "$authf"
+            echo "Saved OpenVPN credentials for '$profile' at $authf"
+            ;;
+        clear|delete|remove)
+            require_root
+            local profile="${1:-}"
+            [[ -n "$profile" ]] || die "usage: tunforge openvpn-auth clear <profile>"
+            _require_openvpn_profile "$profile"
+            local authf; authf="$(_openvpn_auth_file_for "$profile")"
+            rm -f "$authf"
+            echo "Cleared OpenVPN credentials for '$profile'."
+            ;;
+        status|list)
+            local p authf type
+            while IFS= read -r p; do
+                load_profile "$p" 2>/dev/null || continue
+                [[ "${P_TYPE:-}" == "openvpn" ]] || continue
+                authf="$(_openvpn_auth_file_for "$p")"
+                if [[ -s "$authf" ]]; then
+                    printf '%-24s saved (%s)\n' "$p" "$authf"
+                else
+                    printf '%-24s not saved\n' "$p"
+                fi
+            done < <(list_profiles)
+            ;;
+        *)
+            cat >&2 <<EOF
+usage: tunforge openvpn-auth <subcommand>
+  set <profile> [username]   save username/password for an OpenVPN profile
+  clear <profile>            delete saved credentials
+  status                     list OpenVPN profiles and credential status
+EOF
+            return 2
+            ;;
+    esac
+}
+
+cli_purge_wg() {
+    require_root
+    # Build set of tunforge-managed iface names so we can warn vs. report.
+    local -A ours=()
+    local p
+    while IFS= read -r p; do
+        ours["wg-$p"]=1
+    done < <(list_profiles)
+
+    local -a foreign=() managed=()
+    local iface
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        if [[ -n "${ours[$iface]:-}" ]]; then
+            managed+=("$iface")
+        else
+            foreign+=("$iface")
+        fi
+    done < <(ip -o link show type wireguard 2>/dev/null \
+             | awk -F': ' '{ split($2, a, "@"); print a[1] }')
+
+    if (( ${#foreign[@]} == 0 && ${#managed[@]} == 0 )); then
+        echo "purge-wg: no WireGuard interfaces found"
+    else
+        if (( ${#managed[@]} > 0 )); then
+            echo "purge-wg: tunforge-managed:  ${managed[*]}"
+        fi
+        if (( ${#foreign[@]} > 0 )); then
+            echo "purge-wg: foreign (other):   ${foreign[*]}"
+        fi
+        local f
+        for f in "${managed[@]}" "${foreign[@]}"; do
+            echo "  -> tearing down $f"
+            wg-quick down "$f" >/dev/null 2>&1 \
+                || ip link delete dev "$f" 2>/dev/null \
+                || true
+        done
+    fi
+
+    # Wipe wg-quick's policy-routing leftovers regardless.
+    echo "  -> flushing route table 51820 and fwmark rules"
+    ip -4 route flush table 51820 2>/dev/null || true
+    ip -6 route flush table 51820 2>/dev/null || true
+    while ip -4 rule del not from all fwmark 0xca6c lookup 51820 2>/dev/null; do :; done
+    while ip -4 rule del not from all fwmark 0xca6c lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+    while ip -6 rule del not from all fwmark 0xca6c lookup 51820 2>/dev/null; do :; done
+    while ip -6 rule del not from all fwmark 0xca6c lookup main suppress_prefixlength 0 2>/dev/null; do :; done
+
+    # Drop any /run staging artifacts so a re-connect rebuilds from scratch.
+    rm -f "${TUNFORGE_RUN}"/wg-*.conf 2>/dev/null || true
+
+    echo "purge-wg: done"
+}
+
+# General-purpose "big red button" cleanup. Cross-protocol: nukes WG, OpenVPN,
+# sing-box, kill switch, DNS overrides, sysctl hardening, NetworkManager DNS.
+# The thing to run when you're stuck mid-switch and the box "won't connect to
+# anything anymore". See core.sh::core_purge for the gory details.
+cli_purge() {
+    require_root
+    echo "tunforge: full purge - tearing down ALL VPN state"
+    echo "         (set TUNFORGE_PURGE_FOREIGN_WG=1 to also nuke foreign WG ifaces)"
+    echo
+    # Wrap in the file lock so this can't race with a parallel connect.
+    with_lock core_purge | sed 's/^/  /'
+    echo
+    echo "tunforge: system is now on direct connection"
+}
+
+# Dispatcher for the dns-direct allow-list (regex-only). Hosts matching
+# any pattern are resolved EXCLUSIVELY via direct public DNS (8.8.8.8,
+# 1.1.1.1, ...) and never via the system NSS resolver - which is the
+# safe behavior for VPN provider domains your ISP DNS poisons.
+cli_dns_cache() {
+    local sub="${1:-status}"; shift || true
+    case "$sub" in
+        clear|reset)
+            require_root
+            dns_cache_clear
+            echo "DNS cache cleared."
+            ;;
+        refresh|update)
+            require_root
+            dns_cache_refresh
+            ;;
+        status|list|show)
+            if [[ -r "$TUNFORGE_DNS_CACHE" ]]; then
+                echo "DNS cache ($TUNFORGE_DNS_CACHE):"
+                echo "  Host                                 IP               Expires in"
+                echo "  ------------------------------------ ---------------- -----------"
+                local now; now="$(date +%s)"
+                local h ip ts
+                while IFS=$'\t' read -r h ip ts; do
+                    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+                    local left=$(( ts - now ))
+                    if (( left > 0 )); then
+                        printf '  %-36s %-16s %d minutes\n' "$h" "$ip" "$((left/60))"
+                    else
+                        printf '  %-36s %-16s (expired)\n' "$h" "$ip"
+                    fi
+                done < "$TUNFORGE_DNS_CACHE" | sort
+            else
+                echo "DNS cache is empty."
+            fi
+            ;;
+        help|-h|--help)
+            cat <<EOF
+tunforge dns-cache - manage the persistent DNS result cache
+
+  status          show cached hosts + time left
+  clear           delete the entire cache (forces fresh resolution on next connect)
+  refresh         re-resolve all currently cached hosts (background friendly)
+
+The cache is stored at $TUNFORGE_DNS_CACHE and survives reboots.
+Default TTL is 24 hours (TUNFORGE_DNS_CACHE_TTL). Failures are never cached.
+EOF
+            ;;
+        *)
+            echo "unknown subcommand: $sub" >&2
+            echo "try: tunforge dns-cache help" >&2
+            exit 2
+            ;;
+    esac
+}
+
+cli_dns_direct() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list|ls|"")
+            echo "DNS direct-only allow-list (matched hosts skip system NSS):"
+            echo "  file: $TUNFORGE_DNS_DIRECT"
+            echo
+            dns_direct_list
+            ;;
+        add)
+            require_root
+            local re="${1:?usage: tunforge dns-direct add <regex>}"
+            dns_direct_add "$re"
+            echo "added: $re"
+            ;;
+        remove|rm|delete|del)
+            require_root
+            local re="${1:?usage: tunforge dns-direct remove <regex>}"
+            local n; n="$(dns_direct_remove "$re")"
+            echo "removed $n entry(ies) matching '$re'"
+            ;;
+        test|check|resolve)
+            local host="${1:?usage: tunforge dns-direct test <hostname>}"
+            if dns_direct_match "$host"; then
+                echo "MATCH: '$host' is on the dns-direct allow-list"
+                echo "  -> will be resolved ONLY via 8.8.8.8 / 1.1.1.1 / ..."
+                echo "  -> NSS fallback is DISABLED for this host"
+            else
+                echo "no match: '$host' is NOT on the dns-direct allow-list"
+                echo "  -> resolution order: 8.8.8.8 -> 1.1.1.1 -> 9.9.9.9 -> 208.67.222.222 -> system NSS"
+                exit 1
+            fi
+            # Also run the actual resolver and show what comes back, so
+            # the user can verify end-to-end that public DNS works for
+            # this host in their network.
+            echo
+            echo "live resolution test:"
+            local ips
+            if ips="$(resolve_endpoint_ipv4 "$host" 2>&1)"; then
+                echo "  resolved -> $(printf '%s ' $ips)"
+            else
+                echo "  FAILED to resolve. tunforge would refuse to connect to '$host'."
+            fi
+            ;;
+        help|-h|--help)
+            cat <<EOF
+tunforge dns-direct - manage the "direct public DNS only" allow-list
+
+What it does:
+  Hosts matching any regex below are resolved via direct UDP/TCP queries
+  to public DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.9 / 208.67.222.222) and
+  NEVER via the system NSS resolver. Use this for VPN provider domains
+  whose answers your ISP DNS-poisons - tunforge will fail loudly with a
+  clear DNS error instead of silently connecting to a fake IP.
+
+Subcommands:
+  list                show all patterns
+  add <regex>         add a pattern (idempotent: same regex won't dup)
+  remove <regex>      delete pattern by exact regex match
+  test <hostname>     check whether a host matches + live-resolve it
+
+File   : $TUNFORGE_DNS_DIRECT
+Format : one bash extended regex per line; # and ; start comments;
+         matching is case-insensitive against the FQDN.
+
+Examples:
+  tunforge dns-direct add '^my\\.vpn\\.example\\.com$'
+  tunforge dns-direct add '.*\\.censored-vpn\\.io$'
+  tunforge dns-direct test  my.vpn.example.com
+  tunforge dns-direct remove '^my\\.vpn\\.example\\.com$'
+EOF
+            ;;
+        *)
+            echo "unknown subcommand: $sub" >&2
+            echo "try: tunforge dns-direct help" >&2
+            exit 2
+            ;;
+    esac
+}
+
+cli_bypass() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list|ls|status|"")
+            echo "Local development bypass:"
+            echo "  file: $TUNFORGE_BYPASS_FILE"
+            echo "  defaults: ${TUNFORGE_BYPASS_DEFAULTS:-1} (set TUNFORGE_BYPASS_DEFAULTS=0 to disable built-ins)"
+            echo
+            bypass_list
+            ;;
+        add-cidr|add-ip|cidr)
+            require_root
+            local cidr="${1:?usage: tunforge bypass add-cidr <ip-or-cidr>}"
+            bypass_add_cidr "$cidr"
+            echo "added CIDR/IP bypass: $(_bypass_normalize_cidr "$cidr")"
+            ;;
+        add-domain|add-host|domain|add-url|url)
+            require_root
+            local domain="${1:?usage: tunforge bypass add-domain <domain-or-url>}"
+            bypass_add_domain "$domain"
+            echo "added domain bypass: $(_bypass_normalize_domain "$domain")"
+            ;;
+        add)
+            require_root
+            local value="${1:?usage: tunforge bypass add <ip|cidr|domain|url>}"
+            if _bypass_normalize_cidr "$value" >/dev/null 2>&1; then
+                bypass_add_cidr "$value"
+                echo "added CIDR/IP bypass: $(_bypass_normalize_cidr "$value")"
+            else
+                bypass_add_domain "$value"
+                echo "added domain bypass: $(_bypass_normalize_domain "$value")"
+            fi
+            ;;
+        remove-cidr|rm-cidr|del-cidr)
+            require_root
+            local cidr="${1:?usage: tunforge bypass remove-cidr <ip-or-cidr>}"
+            cidr="$(_bypass_normalize_cidr "$cidr")" || die "invalid CIDR/IP"
+            local n; n="$(bypass_remove_entry cidr "$cidr")"
+            echo "removed $n CIDR/IP entr$( [[ "$n" == "1" ]] && echo y || echo ies ): $cidr"
+            ;;
+        remove-domain|rm-domain|del-domain)
+            require_root
+            local domain="${1:?usage: tunforge bypass remove-domain <domain-or-url>}"
+            domain="$(_bypass_normalize_domain "$domain")" || die "invalid domain/URL"
+            local n; n="$(bypass_remove_entry domain "$domain")"
+            echo "removed $n domain entr$( [[ "$n" == "1" ]] && echo y || echo ies ): $domain"
+            ;;
+        remove|rm|delete|del)
+            require_root
+            local value="${1:?usage: tunforge bypass remove <ip|cidr|domain|url>}"
+            local n=0
+            if _bypass_normalize_cidr "$value" >/dev/null 2>&1; then
+                value="$(_bypass_normalize_cidr "$value")"
+                n="$(bypass_remove_entry cidr "$value")"
+            else
+                value="$(_bypass_normalize_domain "$value")" || die "invalid bypass value"
+                n="$(bypass_remove_entry domain "$value")"
+            fi
+            echo "removed $n entr$( [[ "$n" == "1" ]] && echo y || echo ies ): $value"
+            ;;
+        help|-h|--help)
+            cat <<EOF
+tunforge bypass - keep local development services reachable while VPN is on
+
+Built-in CIDR bypasses:
+  127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
+
+Subcommands:
+  list                         show active CIDR/domain bypasses
+  add <ip|cidr|domain|url>     add a bypass entry
+  add-cidr <ip-or-cidr>        add traffic bypass only
+  add-domain <domain-or-url>   route that domain's DNS to WAN DNS
+  remove <value>               remove a configured entry
+
+Examples:
+  sudo tunforge bypass add-cidr 172.17.0.0/16
+  sudo tunforge bypass add-domain backend.local
+  sudo tunforge bypass add mongodb://mongo.dev:27017
+
+Changes apply on next connect. Reconnect the active profile after editing.
+EOF
+            ;;
+        *)
+            echo "unknown subcommand: $sub" >&2
+            echo "try: tunforge bypass help" >&2
+            exit 2
+            ;;
+    esac
+}
+
+# Probe every profile (or a single one) and print a sorted table to
+# stdout. Results are cached so the TUI's connect picker can show them
+# without re-probing.
+cli_test() {
+    local target="${1:-}"
+    if [[ -n "$target" && "$target" != all ]]; then
+        # Single-profile mode: probe just one and print its rtt.
+        [[ -f "${TUNFORGE_PROFILES_DIR}/${target}.profile" ]] \
+            || die "no such profile: $target"
+        echo "Probing $target..."
+        local r
+        r="$(_test_one "$target")"
+        printf '%-20s  %-14s -> %s\n' "$target" "$(_profile_country "$target")" "$r"
+        return 0
+    fi
+
+    require_root || true   # we don't strictly need root for ping (cap_net_raw)
+    echo "tunforge: probing all profiles in parallel"
+    core_test_all
+    echo
+    echo "DNS cache: /var/lib/tunforge/dns-cache (successful resolutions are"
+    echo "cached for TUNFORGE_DNS_CACHE_TTL seconds - default 24 hours)"
+    echo "Reset with: tunforge dns-cache clear"
+    echo
+
+    # Pretty table, grouped by type, sorted by rtt within each group.
+    local cache="$TUNFORGE_TEST_CACHE"
+    [[ -r "$cache" ]] || { echo "(no cache produced)"; return 1; }
+
+    printf '%-7s  %-9s  %-14s  %-20s  %s\n' "RTT"   "TYPE"   "COUNTRY" "NAME"   "DESC"
+    printf '%-7s  %-9s  %-14s  %-20s  %s\n' "-----" "----"   "-------" "----"   "----"
+
+    # Bucketize for type-grouped output.
+    local order=( singbox openvpn wireguard direct other )
+    local _t pfile name r ttype desc country cell key
+    declare -A _bucket
+    for _t in "${order[@]}"; do _bucket[$_t]=""; done
+    while IFS= read -r name; do
+        pfile="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+        ttype="$(awk -F= '/^[[:space:]]*TYPE[[:space:]]*=/{sub(/^[[:space:]]*TYPE[[:space:]]*=/,"");gsub(/"/,"");gsub(/[[:space:]]/,"");print;exit}' "$pfile" 2>/dev/null)"
+        case "$ttype" in
+            singbox|openvpn|wireguard|direct) : ;;
+            *) ttype=other ;;
+        esac
+        desc="$(awk -F= '/^[[:space:]]*DESC[[:space:]]*=/{sub(/^[[:space:]]*DESC[[:space:]]*=/,"");gsub(/"/,"");print;exit}' "$pfile" 2>/dev/null)"
+        country="$(_profile_country "$name")"
+        cell="$(_test_format_cell "$name")"
+        key="$(_test_sort_key "$name")"
+        _bucket[$ttype]+="${key}|${cell}|${name}|${country}|${desc}"$'\n'
+    done < <(list_profiles)
+
+    for _t in "${order[@]}"; do
+        [[ -z "${_bucket[$_t]:-}" ]] && continue
+        # sort numerically by the key prefix
+        printf '%s' "${_bucket[$_t]}" | LC_ALL=C sort | while IFS='|' read -r _key cell name country desc; do
+            printf '%-7s  %-9s  %-14s  %-20s  %s\n' "$cell" "$_t" "$country" "$name" "${desc:-}"
+        done
+    done
+}
+
+# A checklist of the things that have to be true for the box to work, rather
+# than a dump of resolvectl/nft state - if a check fails it says which one, and
+# `tunforge status` is one command away for the raw detail.
+cli_doctor() {
+    local active iface problems=0
+    active="$(state_get_active)"
+    iface="$(state_get_iface)"
+
+    printf '\n== tunforge doctor ==\n'
+
+    # -- What tunforge thinks is going on, and whether reality agrees.
+    if [[ "$active" == "none" ]]; then
+        mark_ok "No VPN active (direct connection)"
+    elif [[ ! -f "${TUNFORGE_PROFILES_DIR}/${active}.profile" ]]; then
+        mark_fail "Active profile '$active' has no profile file"; problems=1
+    else
+        load_profile "$active" 2>/dev/null || true
+        mark_ok "Active profile: $active (${P_TYPE:-?})"
+        if [[ -z "$iface" ]]; then
+            mark_fail "No tunnel interface recorded for '$active'"; problems=1
+        elif ip link show "$iface" >/dev/null 2>&1; then
+            mark_ok "Tunnel interface $iface is up"
+        else
+            mark_fail "Tunnel interface $iface is gone - the tunnel went down"; problems=1
+        fi
+        if [[ "${P_TYPE:-}" != "direct" && "${P_KILL_SWITCH:-yes}" == "yes" ]]; then
+            if nft list table inet tunforge >/dev/null 2>&1; then
+                mark_ok "tunforge kill switch is active"
+            else
+                mark_fail "tunforge kill switch is missing while a VPN is active"; problems=1
+            fi
+        fi
+    fi
+
+    # -- A kill switch with no tunnel is the classic "I have no internet"
+    # state, so call it out even when no profile is active.
+    if [[ "$active" == "none" ]] && nft list table inet tunforge >/dev/null 2>&1; then
+        mark_fail "tunforge kill switch is loaded with no VPN active - traffic is being dropped"
+        problems=1
+    fi
+
+    # -- Name resolution, the usual suspect.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mark_ok "systemd-resolved is running"
+    else
+        mark_fail "systemd-resolved is not running"; problems=1
+    fi
+    if [[ -L /etc/resolv.conf ]]; then
+        mark_ok "/etc/resolv.conf -> $(readlink /etc/resolv.conf)"
+    else
+        mark_warn "/etc/resolv.conf is a plain file, not the systemd-resolved stub"
+    fi
+
+    local probe
+    probe="$(timeout 5 getent ahostsv4 "$TUNFORGE_DNS_PROBE_HOST" 2>/dev/null \
+             | awk '{print $1; exit}' || true)"
+    if [[ -n "$probe" ]]; then
+        mark_ok "DNS replies come back ($TUNFORGE_DNS_PROBE_HOST -> $probe)"
+    else
+        mark_fail "DNS does not resolve"; problems=1
+    fi
+
+    # -- And finally whether anything actually gets out.
+    if command -v curl >/dev/null 2>&1; then
+        local pub
+        pub="$(timeout 8 curl -4 -fsS https://api.ipify.org 2>/dev/null || true)"
+        if [[ -n "$pub" ]]; then
+            mark_ok "Internet is reachable (public IP: $pub)"
+        else
+            mark_fail "Cannot reach the internet"; problems=1
+        fi
+    fi
+
+    printf '\n'
+    if (( problems )); then
+        mark_fail "Problems found. Try: sudo tunforge disconnect  (or: sudo tunforge purge)"
+        return 1
+    fi
+    mark_ok "Everything checks out"
+}
+
+# ---------------------------------------------------------------------------
+# TUI (whiptail)
+# ---------------------------------------------------------------------------
+
+_tui_title='tunforge'
+_tui_W=78
+_tui_H=24
+
+_tui_main_menu() {
+    local active; active="$(state_get_active)"
+    local label
+    if [[ "$active" == "none" ]]; then
+        label="DIRECT (no VPN)"
+    else
+        label="$active"
+    fi
+
+    whiptail --title "$_tui_title - $label" \
+             --menu "Choose an action" \
+             "$_tui_H" "$_tui_W" 13 \
+             "connect"    "Connect to a profile" \
+             "test"       "Probe ALL servers (ping) + show in connect picker" \
+             "disconnect" "Disconnect (return to direct)" \
+             "status"     "Show current status" \
+             "logs"       "Live logs (journalctl tail)" \
+             "import"     "Import V2Ray URI (vmess/vless/trojan/ss)" \
+             "subscription" "Manage V2Ray subscriptions (soft sub)" \
+             "chain"      "Create a chained multi-hop profile (entry -> your exit)" \
+             "manage"     "Manage profiles" \
+             "doctor"     "Health check & verify" \
+             "purge"      "BIG RED BUTTON: nuke ALL VPN state (recover from stuck)" \
+             "purge-wg"   "Narrower: WireGuard-only purge" \
+             "quit"       "Exit" \
+             3>&1 1>&2 2>&3
+}
+
+_tui_connect() {
+    local profiles=() entries=() p desc f active type
+    active="$(state_get_active)"
+    while IFS= read -r p; do profiles+=("$p"); done < <(list_profiles)
+    if (( ${#profiles[@]} == 0 )); then
+        whiptail --title "$_tui_title" --msgbox "No profiles found.\n\nCreate one in $TUNFORGE_PROFILES_DIR or use 'Manage profiles'." 12 "$_tui_W"
+        return
+    fi
+
+    # Bucket profiles by TYPE so the picker shows them grouped:
+    # v2ray (sing-box) first - most common for our censored-network use
+    # case - then openvpn, wireguard, direct. Within each bucket, sort
+    # by ping latency (ascending) using the cached probe results so the
+    # fastest live server appears at the top. Entries with no/stale
+    # cache or DOWN sink to the bottom of their bucket.
+    local -a bk_singbox=() bk_openvpn=() bk_wireguard=() bk_direct=() bk_other=()
+    for p in "${profiles[@]}"; do
+        f="${TUNFORGE_PROFILES_DIR}/${p}.profile"
+        type="$(awk -F= '/^[[:space:]]*TYPE[[:space:]]*=/ {sub(/^[[:space:]]*TYPE[[:space:]]*=/,"");gsub(/"/,"");gsub(/[[:space:]]/,"");print;exit}' "$f" 2>/dev/null)"
+        # Prefix each name with its sort key so we can `sort` and then
+        # strip the prefix - keeps this pure bash, no awk acrobatics.
+        local key; key="$(_test_sort_key "$p")"
+        local row="${key}|${p}"
+        case "$type" in
+            singbox)   bk_singbox+=("$row") ;;
+            openvpn)   bk_openvpn+=("$row") ;;
+            wireguard) bk_wireguard+=("$row") ;;
+            direct)    bk_direct+=("$row") ;;
+            *)         bk_other+=("$row") ;;
+        esac
+    done
+    # Sort each bucket by the rtt-prefix (lexicographic == numeric for
+    # zero-padded keys), then strip the prefix back off.
+    _sort_bucket() {
+        local _b _s
+        for _b in "$@"; do
+            printf '%s\n' "$_b"
+        done | sort | while IFS='|' read -r _ _s; do printf '%s\n' "$_s"; done
+    }
+    local -a s_singbox s_openvpn s_wireguard s_direct s_other
+    if (( ${#bk_singbox[@]}   )); then readarray -t s_singbox   < <(_sort_bucket "${bk_singbox[@]}");   fi
+    if (( ${#bk_openvpn[@]}   )); then readarray -t s_openvpn   < <(_sort_bucket "${bk_openvpn[@]}");   fi
+    if (( ${#bk_wireguard[@]} )); then readarray -t s_wireguard < <(_sort_bucket "${bk_wireguard[@]}"); fi
+    if (( ${#bk_direct[@]}    )); then readarray -t s_direct    < <(_sort_bucket "${bk_direct[@]}");    fi
+    if (( ${#bk_other[@]}     )); then readarray -t s_other     < <(_sort_bucket "${bk_other[@]}");     fi
+
+    # Build the menu in bucket order. Each row is rendered as:
+    #   <name>   "[*] [type ] [ 47ms] [country     ] description"
+    # The fixed-width type / ping / country cells make columns line up.
+    local first=""
+    local -a ordered=( "${s_singbox[@]}" "${s_openvpn[@]}" "${s_wireguard[@]}" "${s_direct[@]}" "${s_other[@]}" )
+    local _tag _ping _country
+    for p in "${ordered[@]}"; do
+        f="${TUNFORGE_PROFILES_DIR}/${p}.profile"
+        type="$(awk -F= '/^[[:space:]]*TYPE[[:space:]]*=/ {sub(/^[[:space:]]*TYPE[[:space:]]*=/,"");gsub(/"/,"");gsub(/[[:space:]]/,"");print;exit}' "$f" 2>/dev/null)"
+        desc="$(awk -F= '/^[[:space:]]*DESC[[:space:]]*=/ {sub(/^[[:space:]]*DESC[[:space:]]*=/,"");gsub(/"/,"");print;exit}' "$f" 2>/dev/null)"
+        case "$type" in
+            singbox)   _tag="v2ray   " ;;
+            openvpn)   _tag="openvpn " ;;
+            wireguard) _tag="wireg.  " ;;
+            direct)    _tag="direct  " ;;
+            *)         _tag="?       " ;;
+        esac
+        _ping="$(_test_format_cell "$p")"
+        _country="$(_profile_country "$p")"
+        local mark=" "
+        if [[ "$p" == "$active" ]]; then mark="*"; fi
+        entries+=("$p" "[$mark] [$_tag] [$_ping] [$(printf '%-12.12s' "$_country")] ${desc:-(no description)}")
+        [[ -z "$first" ]] && first="$p"
+    done
+
+    local choice
+    choice="$(whiptail --title "$_tui_title - select profile" \
+              --menu "Profiles ('*' = currently active)" \
+              "$_tui_H" "$_tui_W" 12 \
+              "${entries[@]}" \
+              --default-item "${active:-$first}" \
+              3>&1 1>&2 2>&3)" || return 0
+
+    [[ -n "$choice" ]] || return 0
+
+    if [[ "$choice" == "$active" ]]; then
+        whiptail --title "$_tui_title" --msgbox "Profile '$choice' is already active." 8 "$_tui_W"
+        return
+    fi
+
+    {
+        echo 10
+        echo "# Tearing down current connection..."
+        sleep 0.3
+        echo 30
+        echo "# Connecting to $choice..."
+        if core_connect "$choice" >/dev/null 2>&1; then
+            echo 90
+            echo "# Verifying..."
+            sleep 0.2
+            echo 100
+        else
+            echo 100
+            echo "# FAILED - see log"
+        fi
+    } | whiptail --title "$_tui_title - connecting" --gauge "Please wait..." 10 "$_tui_W" 0
+
+    if [[ "$(state_get_active)" == "$choice" ]]; then
+        # Success: status panel, with an option to view the full transcript.
+        if whiptail --title "$_tui_title - connected" \
+            --yes-button "OK" --no-button "View log" \
+            --yesno "$(core_status 2>/dev/null)" 18 "$_tui_W"
+        then :
+        else
+            _tui_show_last_log "$_tui_title - connect log ($choice)"
+        fi
+    else
+        # Failure: show the full transcript so the user can see exactly what
+        # was attempted and what went wrong (no journalctl scavenger hunt).
+        _tui_show_last_log "$_tui_title - FAILED ($choice) - scroll: arrows / PgUp / PgDn"
+
+        # Offer a one-click recovery if the transcript matches a known
+        # "stuck state" fingerprint. Two tiers:
+        #   1. WG route conflict   -> purge-wg (narrower, preserves other VPNs)
+        #   2. Anything else looking nasty (process/iface conflict, sing-box
+        #      iface stuck, kill switch hanging) -> full purge.
+        local log="${TUNFORGE_LAST_LOG:-/run/tunforge/connect-last.log}"
+        if [[ -s "$log" ]]; then
+            if grep -qE 'File exists|foreign WG interface|NOT managed by tunforge' "$log"; then
+                if whiptail --title "$_tui_title - WireGuard route conflict" \
+                    --yes-button "Run purge-wg" --no-button "Skip" \
+                    --yesno "The connect failure looks like a WireGuard route conflict:
+another wg interface is already holding the AllowedIPs route we
+need to claim.
+
+Run 'purge-wg' now to tear down ALL WireGuard interfaces (including
+any stray wg0) and flush wg-quick's policy routing, then retry?" 14 "$_tui_W"
+                then
+                    _tui_purge_wg
+                    if whiptail --title "$_tui_title" \
+                        --yes-button "Retry" --no-button "Back" \
+                        --yesno "Retry connecting to '$choice' now?" 8 "$_tui_W"
+                    then
+                        _tui_connect_to "$choice"
+                    fi
+                fi
+            elif grep -qE 'tun-opus0|process exited before|did not complete init|Address already in use|already exists' "$log"; then
+                if whiptail --title "$_tui_title - stuck state detected" \
+                    --yes-button "Run purge" --no-button "Skip" \
+                    --yesno "This failure looks like leftover state from a previous
+run (orphan process, stale interface, or stuck kill switch).
+
+Run a full 'purge' to nuke ALL VPN state across every protocol,
+then retry?" 14 "$_tui_W"
+                then
+                    _tui_purge
+                    if whiptail --title "$_tui_title" \
+                        --yes-button "Retry" --no-button "Back" \
+                        --yesno "Retry connecting to '$choice' now?" 8 "$_tui_W"
+                    then
+                        _tui_connect_to "$choice"
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# Helper: connect to a SPECIFIC profile (used by the failure-recovery flow).
+# The main _tui_connect prompts for which profile; this one already knows.
+_tui_connect_to() {
+    local choice="$1"
+    local active; active="$(state_get_active)"
+    if [[ "$choice" == "$active" ]]; then
+        whiptail --title "$_tui_title" --msgbox "Profile '$choice' is already active." 8 "$_tui_W"
+        return
+    fi
+    {
+        echo 30; echo "# Connecting to $choice..."
+        if core_connect "$choice" >/dev/null 2>&1; then
+            echo 100
+        else
+            echo 100; echo "# FAILED - see log"
+        fi
+    } | whiptail --title "$_tui_title - connecting" --gauge "Please wait..." 10 "$_tui_W" 0
+
+    if [[ "$(state_get_active)" == "$choice" ]]; then
+        if whiptail --title "$_tui_title - connected" \
+            --yes-button "OK" --no-button "View log" \
+            --yesno "$(core_status 2>/dev/null)" 18 "$_tui_W"
+        then :
+        else
+            _tui_show_last_log "$_tui_title - connect log ($choice)"
+        fi
+    else
+        _tui_show_last_log "$_tui_title - FAILED ($choice) - scroll: arrows / PgUp / PgDn"
+    fi
+}
+
+# View the transcript of the last connect attempt. Strips ANSI escapes so the
+# whiptail textbox renders cleanly (whiptail does NOT interpret ANSI).
+_tui_show_last_log() {
+    local title="$1"
+    local log="${TUNFORGE_LAST_LOG:-/run/tunforge/connect-last.log}"
+    if [[ ! -s "$log" ]]; then
+        whiptail --title "$title" --msgbox \
+            "No connect transcript was produced.\n\nThe app may have failed before it could log anything (try 'tunforge doctor')." \
+            12 "$_tui_W"
+        return
+    fi
+    # Render width/height from current terminal so we use the full screen.
+    local rows cols
+    rows="$(tput lines 2>/dev/null || echo 30)"
+    cols="$(tput cols  2>/dev/null || echo 100)"
+    (( rows > 8  )) || rows=24
+    (( cols > 40 )) || cols=80
+    # Strip ANSI escapes (CSI sequences) - whiptail doesn't render them, they
+    # would show up as literal "ESC[31m" garbage otherwise.
+    local stripped
+    stripped="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" connect-view.XXXXXX)"
+    sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' "$log" > "$stripped" 2>/dev/null \
+        || cp "$log" "$stripped"
+    chmod 0644 "$stripped" 2>/dev/null || true
+    whiptail --title "$title" --textbox "$stripped" "$rows" "$cols" || true
+    rm -f "$stripped"
+}
+
+_tui_disconnect() {
+    local active; active="$(state_get_active)"
+    if [[ "$active" == "none" ]]; then
+        whiptail --title "$_tui_title" --msgbox "Already in direct mode." 8 "$_tui_W"
+        return
+    fi
+    whiptail --title "$_tui_title" --yesno "Disconnect from '$active' and return to direct?" 10 "$_tui_W" || return 0
+    {
+        echo 30; echo "# tearing down..."
+        core_disconnect 2>&1 | tail -n 5 >/tmp/tunforge-tui.log
+        echo 100
+    } | whiptail --title "$_tui_title - disconnect" --gauge "Please wait..." 8 "$_tui_W" 0
+    whiptail --title "$_tui_title" --msgbox "Disconnected. System is on direct connection." 8 "$_tui_W"
+}
+
+_tui_status() {
+    whiptail --title "$_tui_title - status" --msgbox "$(core_status 2>/dev/null)" 18 "$_tui_W"
+}
+
+_tui_logs() {
+    clear
+    "${TUNFORGE_PREFIX}/bin/tunforge-logs"
+}
+
+_tui_manage() {
+    local choice
+    choice="$(whiptail --title "$_tui_title - manage profiles" --menu "Action" 16 "$_tui_W" 6 \
+        "list"     "List all profiles" \
+        "scaffold" "Scaffold profiles from existing configs/" \
+        "edit"     "Edit a profile in \$EDITOR" \
+        "ovpn-auth" "Save/clear OpenVPN username + password" \
+        "new"      "Create a new profile (interactive)" \
+        "delete"   "Delete a profile" \
+        3>&1 1>&2 2>&3)" || return 0
+    case "$choice" in
+        list)     _tui_list ;;
+        scaffold) _tui_scaffold ;;
+        edit)     _tui_edit ;;
+        ovpn-auth) _tui_openvpn_auth ;;
+        new)      _tui_new ;;
+        delete)   _tui_delete ;;
+    esac
+}
+
+_tui_openvpn_auth() {
+    local profiles=() entries=() p authf status
+    while IFS= read -r p; do
+        load_profile "$p" 2>/dev/null || continue
+        [[ "${P_TYPE:-}" == "openvpn" ]] || continue
+        authf="$(_openvpn_auth_file_for "$p")"
+        if [[ -s "$authf" ]]; then status="saved"; else status="not saved"; fi
+        profiles+=("$p")
+        entries+=("$p" "$status")
+    done < <(list_profiles)
+    if (( ${#profiles[@]} == 0 )); then
+        whiptail --title "$_tui_title - OpenVPN auth" --msgbox "No OpenVPN profiles found." 8 "$_tui_W"
+        return
+    fi
+    local choice action user pass pass2
+    choice="$(whiptail --title "$_tui_title - OpenVPN auth" \
+        --menu "Pick an OpenVPN profile" 18 "$_tui_W" 10 \
+        "${entries[@]}" 3>&1 1>&2 2>&3)" || return 0
+    action="$(whiptail --title "$_tui_title - OpenVPN auth ($choice)" \
+        --menu "Action" 12 "$_tui_W" 3 \
+        "set" "Save/update credentials" \
+        "clear" "Delete saved credentials" \
+        "back" "Back" \
+        3>&1 1>&2 2>&3)" || return 0
+    case "$action" in
+        set)
+            user="$(whiptail --title "$_tui_title - OpenVPN auth ($choice)" \
+                --inputbox "Username:" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+            [[ -n "$user" ]] || { whiptail --msgbox "Username cannot be empty." 8 "$_tui_W"; return; }
+            pass="$(whiptail --title "$_tui_title - OpenVPN auth ($choice)" \
+                --passwordbox "Password:" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+            pass2="$(whiptail --title "$_tui_title - OpenVPN auth ($choice)" \
+                --passwordbox "Repeat password:" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+            [[ "$pass" == "$pass2" ]] || { whiptail --msgbox "Passwords do not match." 8 "$_tui_W"; return; }
+            authf="$(_openvpn_auth_file_for "$choice")"
+            install -d -m 0700 "$(dirname "$authf")"
+            {
+                printf '%s\n' "$user"
+                printf '%s\n' "$pass"
+            } > "${authf}.tmp"
+            chmod 0600 "${authf}.tmp"
+            mv -f "${authf}.tmp" "$authf"
+            whiptail --title "$_tui_title - OpenVPN auth" \
+                --msgbox "Saved credentials for '$choice'." 8 "$_tui_W"
+            ;;
+        clear)
+            whiptail --yesno "Delete saved credentials for '$choice'?" 8 "$_tui_W" || return 0
+            rm -f "$(_openvpn_auth_file_for "$choice")"
+            whiptail --title "$_tui_title - OpenVPN auth" \
+                --msgbox "Deleted credentials for '$choice'." 8 "$_tui_W"
+            ;;
+    esac
+}
+
+_tui_scaffold() {
+    local out
+    if out="$("${TUNFORGE_PREFIX}/bin/tunforge-scaffold" 2>&1)"; then
+        whiptail --title "$_tui_title - scaffold" --scrolltext --msgbox "$out" 20 "$_tui_W"
+    else
+        whiptail --title "$_tui_title - scaffold FAILED" --scrolltext --msgbox "$out" 20 "$_tui_W"
+    fi
+}
+
+_tui_list() {
+    local body=""
+    body="$(cli_list)"
+    [[ -z "$body" ]] && body="(no profiles)"
+    whiptail --title "$_tui_title - profiles" --msgbox "$body" 18 "$_tui_W"
+}
+
+_tui_edit() {
+    local profiles=() entries=() p
+    while IFS= read -r p; do profiles+=("$p"); entries+=("$p" ""); done < <(list_profiles)
+    if (( ${#profiles[@]} == 0 )); then
+        whiptail --title "$_tui_title" --msgbox "No profiles to edit." 8 "$_tui_W"
+        return
+    fi
+    local choice
+    choice="$(whiptail --title "$_tui_title - edit" --menu "Pick a profile" 18 "$_tui_W" 10 \
+              "${entries[@]}" 3>&1 1>&2 2>&3)" || return 0
+    "${EDITOR:-nano}" "${TUNFORGE_PROFILES_DIR}/${choice}.profile"
+}
+
+_tui_new() {
+    local name type desc country
+    name="$(whiptail --title "$_tui_title - new profile" --inputbox "Profile name (no spaces)" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$name" && "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { whiptail --msgbox "Invalid name." 8 "$_tui_W"; return; }
+    if [[ -e "${TUNFORGE_PROFILES_DIR}/${name}.profile" ]]; then
+        whiptail --msgbox "Profile '$name' already exists." 8 "$_tui_W"; return
+    fi
+    type="$(whiptail --title "$_tui_title - new profile" --menu "Type" 14 "$_tui_W" 4 \
+        "direct"    "no VPN, router DNS" \
+        "wireguard" ".conf via wg-quick" \
+        "openvpn"   ".ovpn" \
+        "singbox"   "sing-box JSON (V2Ray etc.)" \
+        3>&1 1>&2 2>&3)" || return 0
+    desc="$(whiptail --title "$_tui_title - new profile" --inputbox "Description (free text)" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+    country="$(whiptail --title "$_tui_title - new profile" \
+        --inputbox "Country / location (optional, e.g. Germany or DE):" \
+        10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+
+    install -d -m 0750 "$TUNFORGE_PROFILES_DIR"
+    local f="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+    cat > "$f" <<EOF
+TYPE=$type
+DESC="$desc"
+COUNTRY="$country"
+# Path to the underlying config file. Place it under ${TUNFORGE_CONFIGS_DIR}/$type/
+CONFIG=${TUNFORGE_CONFIGS_DIR}/$type/${name}.$( case "$type" in wireguard) echo conf;; openvpn) echo ovpn;; singbox) echo json;; *) echo conf;; esac )
+# Custom DNS for THIS profile. NEVER use 8.8.8.8/8.8.4.4 - see README.
+DNS_SERVERS="1.1.1.1 9.9.9.9"
+DNS_OVER_TLS=opportunistic
+KILL_SWITCH=yes
+IPV6=disable
+# Optional: pin endpoint IP (otherwise auto-resolved at connect time)
+# ENDPOINT_IP=
+# Optional: override MTU
+# MTU=1280
+EOF
+    chmod 0640 "$f"
+    whiptail --title "$_tui_title" --msgbox "Created $f\n\nNow drop the underlying config at:\n  $(awk -F= '/^CONFIG=/{print $2}' "$f")" 14 "$_tui_W"
+    "${EDITOR:-nano}" "$f"
+}
+
+_tui_delete() {
+    local profiles=() entries=() p
+    while IFS= read -r p; do profiles+=("$p"); entries+=("$p" ""); done < <(list_profiles)
+    (( ${#profiles[@]} )) || { whiptail --msgbox "No profiles." 8 "$_tui_W"; return; }
+    local choice
+    choice="$(whiptail --title "$_tui_title - delete" --menu "Pick a profile to delete" 18 "$_tui_W" 10 \
+              "${entries[@]}" 3>&1 1>&2 2>&3)" || return 0
+    whiptail --yesno "Delete profile '$choice'?\n\nUnderlying config files will be left in place." 10 "$_tui_W" || return 0
+    rm -f "${TUNFORGE_PROFILES_DIR}/${choice}.profile"
+}
+
+_tui_doctor() {
+    local body
+    # cli_doctor exits non-zero when it finds problems, which is precisely when
+    # we most want to show its output rather than fall out of the menu.
+    body="$(cli_doctor 2>&1 || true)"
+    whiptail --title "$_tui_title - doctor" --scrolltext --msgbox "$body" 25 "$_tui_W"
+}
+
+# Run a parallel ping/TCP probe across every profile and surface the
+# results. Stays inside whiptail's gauge so the user sees progress
+# instead of staring at a frozen menu.
+_tui_test() {
+    local profiles=()
+    while IFS= read -r p; do profiles+=("$p"); done < <(list_profiles)
+    if (( ${#profiles[@]} == 0 )); then
+        whiptail --title "$_tui_title" --msgbox "No profiles to test." 8 "$_tui_W"
+        return
+    fi
+
+    {
+        echo 5
+        echo "# Probing ${#profiles[@]} profile(s)..."
+        # Run the probe in a subshell so the gauge can move; we cheat
+        # the progress bar (we don't know real progress per server) by
+        # ramping it manually while the real work runs in the
+        # background. Once the probe finishes, snap to 100.
+        ( core_test_all >/dev/null 2>&1 ) &
+        local probe_pid=$!
+        local pct=10
+        while kill -0 "$probe_pid" 2>/dev/null; do
+            (( pct < 90 )) && pct=$(( pct + 5 ))
+            echo "$pct"
+            echo "# Pinging servers in parallel (cap=8 concurrent)..."
+            sleep 0.5
+        done
+        wait "$probe_pid" 2>/dev/null || true
+        echo 100
+        echo "# Done."
+    } | whiptail --title "$_tui_title - testing" --gauge "Please wait..." 10 "$_tui_W" 0
+
+    # Build a results summary for the modal.
+    local lines="" name r type cell country
+    while IFS= read -r name; do
+        local pfile="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+        type="$(awk -F= '/^[[:space:]]*TYPE[[:space:]]*=/{sub(/^[[:space:]]*TYPE[[:space:]]*=/,"");gsub(/"/,"");gsub(/[[:space:]]/,"");print;exit}' "$pfile" 2>/dev/null)"
+        cell="$(_test_format_cell "$name")"
+        country="$(_profile_country "$name")"
+        r="$(core_test_get_cached "$name" 2>/dev/null || echo '?')"
+        lines+="  ${cell}   ${type:-?}   ${country}   ${name}"$'\n'
+    done < <(list_profiles)
+    whiptail --title "$_tui_title - test results" --scrolltext \
+        --yes-button "Connect..." --no-button "Back" \
+        --yesno "Probed at $(date '+%H:%M:%S')
+
+  RTT     TYPE         COUNTRY          NAME
+  ----    ----         -------          ----
+${lines}
+Tip: results are cached for 5 min and shown next to each entry in
+the connect picker (sorted by latency within each type bucket).
+
+Open the connect picker now?" 25 "$_tui_W" \
+        && _tui_connect
+}
+
+_tui_purge_wg() {
+    # Show what's currently up so the user knows what they're destroying.
+    local current
+    current="$(ip -o link show type wireguard 2>/dev/null \
+              | awk -F': ' '{ split($2, a, "@"); print "  " a[1] }')"
+    [[ -z "$current" ]] && current="  (none)"
+    whiptail --title "$_tui_title - purge-wg" \
+        --yes-button "Purge" --no-button "Cancel" \
+        --yesno "This will:
+  - Tear down ALL WireGuard interfaces (tunforge AND foreign)
+  - Flush wg-quick policy routing (table 51820 + fwmark rules)
+  - Remove staged /run/tunforge/wg-*.conf files
+
+Currently up:
+$current
+
+Use this when you see 'RTNETLINK answers: File exists' on connect,
+or when a stray wg0 interface from a manual wg-quick is blocking us.
+
+Continue?" 22 "$_tui_W" || return 0
+
+    local out
+    out="$(cli_purge_wg 2>&1)" || true
+    whiptail --title "$_tui_title - purge-wg" --scrolltext \
+        --msgbox "$out" 18 "$_tui_W"
+}
+
+# General-purpose "I'm stuck, fix it" path. This is the cross-protocol
+# nuclear option. Different from purge-wg: it ALSO kills openvpn / sing-box,
+# tears down the kill switch (so the box can talk to the LAN/internet again),
+# reverts DNS, restores sysctls, and cleans staging files.
+_tui_purge() {
+    local snap=""
+    snap+=$'WireGuard interfaces:\n'
+    snap+="$(ip -o link show type wireguard 2>/dev/null \
+            | awk -F': ' '{ split($2, a, "@"); print "  " a[1] }')"
+    [[ "$snap" == *$'\n' ]] || snap+=$'\n  (none)\n'
+
+    snap+=$'\ntunforge-spawned daemons:\n'
+    local _ovpn_pids _sb_pids
+    _ovpn_pids="$(pgrep -f 'openvpn-tunforge-' 2>/dev/null | tr '\n' ' ')"
+    _sb_pids="$(pgrep -f "sing-box.*${TUNFORGE_RUN}/singbox-" 2>/dev/null | tr '\n' ' ')"
+    snap+="  openvpn pids: ${_ovpn_pids:-(none)}"$'\n'
+    snap+="  sing-box pids: ${_sb_pids:-(none)}"$'\n'
+
+    snap+=$'\nKill switch (nft): '
+    if "${TUNFORGE_LIB}/firewall.sh" show 2>/dev/null | grep -q 'tunforge'; then
+        snap+="ACTIVE (blocking traffic)"$'\n'
+    else
+        snap+="not active"$'\n'
+    fi
+
+    whiptail --title "$_tui_title - purge (full)" \
+        --yes-button "Purge everything" --no-button "Cancel" \
+        --yesno "Cross-protocol cleanup (the big red button).
+
+This will:
+  - Kill ALL tunforge-spawned openvpn/sing-box processes
+  - Tear down ALL WireGuard interfaces (tunforge-managed)
+  - Delete tun-opus0 if present
+  - Drop the nft kill switch (restores internet)
+  - Revert DNS on all links
+  - Restore sysctl baseline
+  - Wipe staging files
+  - Clear state → direct connection
+
+Current state:
+$snap
+
+NOTE: foreign WG ifaces (wg0 etc.) are NOT touched unless
+TUNFORGE_PURGE_FOREIGN_WG=1 is set.
+
+Continue?" 24 "$_tui_W" || return 0
+
+    local out
+    out="$(cli_purge 2>&1)" || true
+    whiptail --title "$_tui_title - purge done" --scrolltext \
+        --msgbox "$out" 24 "$_tui_W"
+}
+
+_tui_import() {
+    local uri name out
+    uri="$(whiptail --title "$_tui_title - import V2Ray URI" \
+        --inputbox "Paste a vmess://, vless://, trojan:// or ss:// URI:" \
+        12 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$uri" ]] || return 0
+    name="$(whiptail --title "$_tui_title - import" \
+        --inputbox "Profile name (leave empty to derive from the URI's #label):" \
+        10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+
+    if out="$("${TUNFORGE_PREFIX}/bin/tunforge-import" "$uri" "$name" 2>&1)"; then
+        whiptail --title "$_tui_title - imported" --msgbox \
+            "$out\n\nYou can now connect via: Main menu -> Connect to profile" \
+            14 "$_tui_W"
+    else
+        whiptail --title "$_tui_title - import FAILED" --scrolltext --msgbox \
+            "$out" 18 "$_tui_W"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# VPN chaining (multi-hop) wizard
+# ---------------------------------------------------------------------------
+# Builds a single sing-box config that enters through one provider hop (the
+# "entry" - v2ray URI or WireGuard .conf, typically NOT yours) and exits through
+# a second v2ray server (your own box), using sing-box's `detour` field: the
+# exit outbound is dialed THROUGH the entry hop (outbound or endpoint).
+#
+#   TUN -> exit (detour: entry) -> entry -> WAN -> entry server -> exit server
+#
+# The wizard collects each hop's protocol/host/port/credentials/TLS/transport,
+# emits a clean comment-free JSON (validated with `sing-box check`), writes the
+# matching profile, and offers to connect. It produces an ordinary TYPE=singbox
+# profile, so the existing connector, kill switch, DNS lock and verification all
+# apply unchanged.
+
+# Read a dynamically-named global (set by _chain_collect_hop via printf -v).
+_gv() { local _n="$1"; printf '%s' "${!_n-}"; }
+
+# Apply a parser envelope from tunforge-import (--emit / --emit-wgconf).
+# Sets globals prefixed by $1:
+#   <pfx>_OB      sing-box outbound JSON (v2ray hops; tag "proxy")
+#   <pfx>_EP      sing-box wireguard endpoint JSON (entry WG only)
+#   <pfx>_SERVER  upstream host (kill-switch route exception + DESC)
+#   <pfx>_PROTO   wireguard | vless | vmess | trojan | shadowsocks | ...
+#   <pfx>_PORT    server port
+_chain_apply_envelope() {
+    local pfx="$1" envelope="$2" title="$3"
+    local hop server ob ep ptype pport
+
+    hop="$(jq -r '.hop // "v2ray"' <<<"$envelope" 2>/dev/null)"
+    server="$(jq -r '.server // ""' <<<"$envelope" 2>/dev/null)"
+    if [[ "$hop" == "wireguard" ]]; then
+        ep="$(jq -c '.endpoint' <<<"$envelope" 2>/dev/null)"
+        ptype="wireguard"
+        pport="$(jq -r '.endpoint.peers[0].port // "?"' <<<"$envelope" 2>/dev/null)"
+        if [[ -z "$server" || "$server" == "null" || -z "$ep" || "$ep" == "null" ]]; then
+            whiptail --msgbox "The parser produced no usable WireGuard endpoint." 8 "$_tui_W"
+            return 1
+        fi
+        printf -v "${pfx}_OB"     '%s' ""
+        printf -v "${pfx}_EP"     '%s' "$ep"
+        printf -v "${pfx}_SERVER" '%s' "$server"
+        printf -v "${pfx}_PROTO"  '%s' "$ptype"
+        printf -v "${pfx}_PORT"   '%s' "$pport"
+        whiptail --title "$_tui_title - $title" --msgbox \
+            "Parsed OK:\n\n  type:   wireguard (sing-box endpoint)\n  server: $server:$pport\n\nKeys/peer taken from the .conf file." 12 "$_tui_W" || true
+        return 0
+    fi
+
+    ob="$(jq -c '.outbound' <<<"$envelope" 2>/dev/null)"
+    if [[ -z "$server" || "$server" == "null" || -z "$ob" || "$ob" == "null" ]]; then
+        whiptail --msgbox "The parser produced no usable outbound for this hop." 8 "$_tui_W"
+        return 1
+    fi
+    ptype="$(jq -r '.type // "?"' <<<"$ob" 2>/dev/null)"
+    pport="$(jq -r '.server_port // "?"' <<<"$ob" 2>/dev/null)"
+    printf -v "${pfx}_OB"     '%s' "$ob"
+    printf -v "${pfx}_EP"     '%s' ""
+    printf -v "${pfx}_SERVER" '%s' "$server"
+    printf -v "${pfx}_PROTO"  '%s' "$ptype"
+    printf -v "${pfx}_PORT"   '%s' "$pport"
+    whiptail --title "$_tui_title - $title" --msgbox \
+        "Parsed OK:\n\n  type:   $ptype\n  server: $server:$pport\n\nTransport/TLS taken verbatim from the URI." 12 "$_tui_W" || true
+    return 0
+}
+
+# Collect one hop from a pasted V2Ray URI or (ENTRY only) a WireGuard .conf.
+# Uses tunforge-import read-only --emit / --emit-wgconf. Sets <pfx>_OB / <pfx>_EP
+# etc. via _chain_apply_envelope. $2 is the dialog title. Returns 1 on cancel.
+# Prompt for a subscription URL, fetch its server list, and let the user pick
+# one server. On success sets the global _CHAIN_PICKED_URI and returns 0.
+# Returns 1 on cancel/failure. (Uses a global rather than stdout so the inner
+# whiptail dialogs still render — command substitution would steal the UI.)
+_chain_pick_from_sub() {
+    local title="$1" suburl listfile errfile err
+    _CHAIN_PICKED_URI=""
+
+    suburl="$(whiptail --title "$_tui_title - $title" \
+        --inputbox "Subscription URL (returns a list of servers):" 10 "$_tui_W" "https://" 3>&1 1>&2 2>&3)" || return 1
+    suburl="${suburl#"${suburl%%[![:space:]]*}"}"; suburl="${suburl%"${suburl##*[![:space:]]}"}"
+    [[ "$suburl" == http://* || "$suburl" == https://* ]] || {
+        whiptail --msgbox "Subscription URL must start with http:// or https://." 8 "$_tui_W"; return 1; }
+
+    listfile="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" chain-sub.XXXXXX 2>/dev/null || mktemp)"
+    errfile="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" chain-suberr.XXXXXX 2>/dev/null || mktemp)"
+    TERM=ansi whiptail --title "$_tui_title - $title" --infobox \
+        "Fetching subscription...\n\n$suburl" 9 "$_tui_W"
+    if ! "${TUNFORGE_PREFIX}/bin/tunforge-subscription" emit "$suburl" >"$listfile" 2>"$errfile"; then
+        err="$(cat "$errfile" 2>/dev/null)"; rm -f "$listfile" "$errfile"
+        whiptail --title "$_tui_title - $title" --scrolltext --msgbox \
+            "Could not fetch/parse that subscription:\n\n${err:-unknown error}" 14 "$_tui_W"
+        return 1
+    fi
+    rm -f "$errfile"
+
+    local -a uris=() menu=()
+    local note server uri i=0
+    while IFS=$'\t' read -r note server uri; do
+        [[ -n "$uri" ]] || continue
+        i=$(( i + 1 ))
+        uris[i]="$uri"
+        menu+=( "$i" "$(printf '%.42s  [%s]' "$note" "$server")" )
+    done < "$listfile"
+    rm -f "$listfile"
+
+    (( i > 0 )) || { whiptail --msgbox "Subscription returned no usable servers." 8 "$_tui_W"; return 1; }
+
+    local choice
+    choice="$(whiptail --title "$_tui_title - $title" \
+        --menu "Pick the ENTRY server ($i found):" 20 "$_tui_W" 12 \
+        "${menu[@]}" 3>&1 1>&2 2>&3)" || return 1
+    [[ -n "${uris[choice]:-}" ]] || { whiptail --msgbox "No server selected." 8 "$_tui_W"; return 1; }
+    _CHAIN_PICKED_URI="${uris[choice]}"
+    return 0
+}
+
+_chain_collect_hop() {
+    local pfx="$1" title="$2"
+    local uri wgpath envelope tmpf err method
+    local -a menu=(
+        "uri"    "Paste a single URI (vmess/vless/trojan/ss)"
+        "sub"    "Pull from a subscription URL and pick a server"
+    )
+    [[ "$pfx" == "ENTRY" ]] && menu+=( "wgconf" "WireGuard .conf (provider entry)" )
+
+    method="$(whiptail --title "$_tui_title - $title" --menu \
+        "How do you want to provide this hop?" 14 "$_tui_W" 3 \
+        "${menu[@]}" 3>&1 1>&2 2>&3)" || return 1
+
+    tmpf="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" chain-emit.XXXXXX 2>/dev/null || mktemp)"
+    if [[ "$method" == "wgconf" ]]; then
+        local default="${TUNFORGE_CONFIGS_DIR}/wireguard/"
+        wgpath="$(whiptail --title "$_tui_title - $title" \
+            --inputbox "Path to the provider's wg-quick .conf:" \
+            10 "$_tui_W" "$default" 3>&1 1>&2 2>&3)" || { rm -f "$tmpf"; return 1; }
+        wgpath="${wgpath#"${wgpath%%[![:space:]]*}"}"; wgpath="${wgpath%"${wgpath##*[![:space:]]}"}"
+        [[ -n "$wgpath" ]] || { rm -f "$tmpf"; whiptail --msgbox "Path cannot be empty." 8 "$_tui_W"; return 1; }
+        if ! envelope="$("${TUNFORGE_PREFIX}/bin/tunforge-import" --emit-wgconf "$wgpath" 2>"$tmpf")"; then
+            err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
+            whiptail --title "$_tui_title - $title" --scrolltext --msgbox \
+                "Could not parse that WireGuard config:\n\n${err:-unknown error}" 14 "$_tui_W"
+            return 1
+        fi
+    elif [[ "$method" == "sub" ]]; then
+        rm -f "$tmpf"
+        _chain_pick_from_sub "$title" || return 1
+        uri="$_CHAIN_PICKED_URI"
+        tmpf="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" chain-emit.XXXXXX 2>/dev/null || mktemp)"
+        if ! envelope="$("${TUNFORGE_PREFIX}/bin/tunforge-import" --emit "$uri" 2>"$tmpf")"; then
+            err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
+            whiptail --title "$_tui_title - $title" --scrolltext --msgbox \
+                "Could not parse that URI:\n\n${err:-unknown error}" 14 "$_tui_W"
+            return 1
+        fi
+    else
+        uri="$(whiptail --title "$_tui_title - $title" \
+            --inputbox "Paste this hop's URI (vmess:// vless:// trojan:// ss://):" \
+            12 "$_tui_W" 3>&1 1>&2 2>&3)" || { rm -f "$tmpf"; return 1; }
+        uri="${uri#"${uri%%[![:space:]]*}"}"; uri="${uri%"${uri##*[![:space:]]}"}"
+        [[ -n "$uri" ]] || { rm -f "$tmpf"; whiptail --msgbox "URI cannot be empty." 8 "$_tui_W"; return 1; }
+        case "$uri" in
+            vmess://*|vless://*|trojan://*|ss://*) : ;;
+            *) rm -f "$tmpf"; whiptail --msgbox "Unsupported URI scheme.\nUse vmess:// vless:// trojan:// or ss://." 9 "$_tui_W"; return 1 ;;
+        esac
+        if ! envelope="$("${TUNFORGE_PREFIX}/bin/tunforge-import" --emit "$uri" 2>"$tmpf")"; then
+            err="$(cat "$tmpf" 2>/dev/null)"; rm -f "$tmpf"
+            whiptail --title "$_tui_title - $title" --scrolltext --msgbox \
+                "Could not parse that URI:\n\n${err:-unknown error}" 14 "$_tui_W"
+            return 1
+        fi
+    fi
+    rm -f "$tmpf"
+    _chain_apply_envelope "$pfx" "$envelope" "$title"
+}
+
+# Assemble the full chained sing-box config from the parsed ENTRY_OB / EXIT_OB
+# outbounds. Re-tags them ("entry"/"exit"), points exit's detour at entry, and
+# pins ONLY the entry's IP as a direct route exception (the exit is reached
+# through the entry, so it stays a hostname for the entry to resolve).
+_chain_build_config() {
+    local entry_ip es tun_mtu=9000
+    local exit_ob
+    exit_ob="$(jq -c '.tag = "exit" | .detour = "entry"' <<<"$(_gv EXIT_OB)")" || return 1
+
+    # The entry hop is the only one dialed directly over the WAN, so pin its IP
+    # as a direct route exception (belt-and-braces against the dial looping back
+    # into the TUN). The exit hop is reached THROUGH the entry, so it must NOT be
+    # excepted. If the entry is a hostname we resolve it; failure just omits the
+    # rule (the connector's bind_interface=WAN still handles the dial).
+    es="$(_gv ENTRY_SERVER)"
+    if [[ "$es" =~ ^[0-9.]+$ ]]; then
+        entry_ip="$es"
+    else
+        entry_ip="$(resolve_endpoint_ipv4 "$es" 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ "$(_gv ENTRY_PROTO)" == "wireguard" ]]; then
+        local entry_ep
+        tun_mtu=1280
+        entry_ep="$(jq -c '.tag = "entry"' <<<"$(_gv ENTRY_EP)")" || return 1
+        jq -n \
+            --argjson entry_ep "$entry_ep" \
+            --argjson exit     "$exit_ob" \
+            --arg entry_ip     "${entry_ip:-}" \
+            --argjson tun_mtu  "$tun_mtu" \
+        '
+        {
+            log: { level: "info", timestamp: true },
+            dns: {
+                servers: [ { tag: "proxy-dns", type: "udp", server: "1.1.1.1", detour: "exit" } ],
+                strategy: "ipv4_only"
+            },
+            inbounds: [
+                {
+                    type: "tun",
+                    tag: "opus-tun-in",
+                    interface_name: "tun-opus0",
+                    address: [ "172.19.0.1/30" ],
+                    mtu: $tun_mtu,
+                    auto_route: true,
+                    strict_route: true,
+                    stack: "system"
+                }
+            ],
+            endpoints: [ $entry_ep ],
+            outbounds: [ $exit, { tag: "direct", type: "direct" } ],
+            route: {
+                auto_detect_interface: true,
+                final: "exit",
+                rules: (
+                    [ { action: "sniff" }, { action: "hijack-dns", protocol: "dns" } ]
+                    + (if $entry_ip != "" then [ { outbound: "direct", ip_cidr: [ ($entry_ip + "/32") ] } ] else [] end)
+                )
+            }
+        }
+        '
+        return 0
+    fi
+
+    local entry_ob
+    entry_ob="$(jq -c '.tag = "entry" | del(.detour)' <<<"$(_gv ENTRY_OB)")" || return 1
+    jq -n \
+        --argjson entry "$entry_ob" \
+        --argjson exit  "$exit_ob" \
+        --arg entry_ip  "${entry_ip:-}" \
+        --argjson tun_mtu "$tun_mtu" \
+    '
+    {
+        log: { level: "info", timestamp: true },
+        dns: {
+            servers: [ { tag: "proxy-dns", type: "udp", server: "1.1.1.1", detour: "exit" } ],
+            strategy: "ipv4_only"
+        },
+        inbounds: [
+            {
+                type: "tun",
+                tag: "opus-tun-in",
+                interface_name: "tun-opus0",
+                address: [ "172.19.0.1/30" ],
+                mtu: $tun_mtu,
+                auto_route: true,
+                strict_route: true,
+                stack: "system"
+            }
+        ],
+        outbounds: [ $exit, $entry, { tag: "direct", type: "direct" } ],
+        route: {
+            auto_detect_interface: true,
+            final: "exit",
+            rules: (
+                [ { action: "sniff" }, { action: "hijack-dns", protocol: "dns" } ]
+                + (if $entry_ip != "" then [ { outbound: "direct", ip_cidr: [ ($entry_ip + "/32") ] } ] else [] end)
+            )
+        }
+    }
+    '
+}
+
+_tui_chain() {
+    command -v jq >/dev/null 2>&1 || {
+        whiptail --title "$_tui_title - chain" --msgbox \
+            "jq is required for the chaining wizard (apt install jq)." 8 "$_tui_W"
+        return
+    }
+
+    whiptail --title "$_tui_title - VPN chaining (multi-hop)" --msgbox \
+"Build a 2-hop chain:
+
+  you -> ENTRY server (a provider node, NOT yours)
+       -> EXIT server  (your own v2ray box)
+       -> internet
+
+Your real IP only ever touches the ENTRY; the ENTRY only sees
+encrypted traffic to your EXIT.
+
+ENTRY hop: pasted URI, subscription pick, or a provider WireGuard
+.conf (wg-quick format). EXIT hop: pasted URI or subscription." 20 "$_tui_W" || return 0
+
+    local name
+    name="$(whiptail --title "$_tui_title - chain" \
+        --inputbox "Profile name (no spaces):" 10 "$_tui_W" "chain" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$name" && "$name" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        whiptail --msgbox "Invalid name (use letters, digits, . _ -)." 8 "$_tui_W"; return; }
+    if [[ -e "${TUNFORGE_PROFILES_DIR}/${name}.profile" ]]; then
+        whiptail --msgbox "Profile '$name' already exists." 8 "$_tui_W"; return
+    fi
+
+    _chain_collect_hop ENTRY "ENTRY hop (provider - NOT yours)" || return 0
+    _chain_collect_hop EXIT  "EXIT hop (your own server)"       || return 0
+
+    local dns country
+    dns="$(whiptail --title "$_tui_title - chain" \
+        --inputbox "DNS servers (space-separated; NEVER 8.8.8.8):" 10 "$_tui_W" "1.1.1.1 9.9.9.9" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$dns" ]] || dns="1.1.1.1 9.9.9.9"
+    if [[ "$dns" == *8.8.8.8* || "$dns" == *8.8.4.4* ]]; then
+        whiptail --msgbox "Google DNS is forbidden (it correlates with your account).\nUsing 1.1.1.1 9.9.9.9 instead." 9 "$_tui_W"
+        dns="1.1.1.1 9.9.9.9"
+    fi
+    country="$(whiptail --title "$_tui_title - chain" \
+        --inputbox "Country / location for the EXIT (optional):" 10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+
+    local conf="${TUNFORGE_CONFIGS_DIR}/singbox/${name}.json"
+    local prof="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+    install -d -m 0750 "${TUNFORGE_CONFIGS_DIR}/singbox" "$TUNFORGE_PROFILES_DIR"
+
+    local cfg
+    if ! cfg="$(_chain_build_config 2>/dev/null)" || [[ -z "$cfg" ]]; then
+        whiptail --title "$_tui_title - chain FAILED" --msgbox \
+            "Could not build the sing-box config (jq error)." 8 "$_tui_W"
+        return
+    fi
+    printf '%s\n' "$cfg" > "${conf}.tmp"
+    chmod 0640 "${conf}.tmp"
+
+    # Validate, but (like import) save anyway and let the user fix in $EDITOR.
+    local check_out="" check_ok=1
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! check_out="$(sing-box check -c "${conf}.tmp" 2>&1)"; then check_ok=0; fi
+    fi
+    mv -f "${conf}.tmp" "$conf"
+
+    {
+        printf 'TYPE=singbox\n'
+        printf 'DESC="Chain: %s -> %s (entry->exit)"\n' "$(_gv ENTRY_SERVER)" "$(_gv EXIT_SERVER)"
+        printf 'COUNTRY="%s"\n' "$country"
+        printf 'CONFIG=%s\n' "$conf"
+        printf 'DNS_SERVERS="%s"\n' "$dns"
+        printf 'DNS_OVER_TLS=opportunistic\n'
+        printf 'KILL_SWITCH=yes\n'
+        printf 'IPV6=disable\n'
+        printf '# Chained (multi-hop) profile generated by the TUI wizard.\n'
+        printf '# entry hop (%s) is dialed over the WAN; exit hop (%s) detours through it.\n' \
+            "$(_gv ENTRY_PROTO)" "$(_gv EXIT_PROTO)"
+        if [[ "$(_gv ENTRY_PROTO)" == "wireguard" ]]; then
+            printf 'MTU=1280\n'
+            printf '# WireGuard entry: double encapsulation often needs a smaller MTU.\n'
+        fi
+        printf '# Edit %s to tweak transports, REALITY, flow, etc.\n' "$conf"
+    } > "${prof}.tmp"
+    chmod 0640 "${prof}.tmp"
+    mv -f "${prof}.tmp" "$prof"
+
+    if (( check_ok )); then
+        if whiptail --title "$_tui_title - chain created" \
+            --yes-button "Connect now" --no-button "Later" \
+            --yesno "Created chained profile '$name':
+
+  entry: $(_gv ENTRY_PROTO)  $(_gv ENTRY_SERVER):$(_gv ENTRY_PORT)
+  exit : $(_gv EXIT_PROTO)  $(_gv EXIT_SERVER):$(_gv EXIT_PORT)
+
+config:  $conf
+profile: $prof
+
+sing-box check: OK
+
+Connect to it now?" 20 "$_tui_W"
+        then
+            _tui_connect_to "$name"
+        fi
+    else
+        whiptail --title "$_tui_title - chain created (check FAILED)" --scrolltext --msgbox \
+"Created '$name' but 'sing-box check' reported problems:
+
+$check_out
+
+Files were still written:
+  $conf
+  $prof
+
+Fix the config (Manage profiles -> Edit, or edit the JSON directly),
+then re-run 'sing-box check -c $conf' and connect." 24 "$_tui_W"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subscriptions (soft sub): a URL that returns a list of V2Ray servers.
+# Delegates to tunforge-subscription; the generated profiles then show up in
+# the normal connect picker.
+# ---------------------------------------------------------------------------
+_subscription_bin() { printf '%s\n' "${TUNFORGE_PREFIX}/bin/tunforge-subscription"; }
+
+# Run a subscription action inside a gauge (fetch/import can take a while).
+_tui_sub_run() {
+    local title="$1"; shift
+    local out tmp; tmp="$(mktemp -p "${TUNFORGE_RUN:-/tmp}" sub-run.XXXXXX)"
+    {
+        echo 20; echo "# $title..."
+        if "$(_subscription_bin)" "$@" >"$tmp" 2>&1; then
+            echo 100
+        else
+            echo 100; echo "# FAILED"
+        fi
+    } | whiptail --title "$_tui_title - $title" --gauge "Please wait..." 8 "$_tui_W" 0
+    out="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp"
+    [[ -n "$out" ]] || out="(no output)"
+    whiptail --title "$_tui_title - $title" --scrolltext --msgbox "$out" 20 "$_tui_W"
+}
+
+_tui_subscription() {
+    local choice
+    choice="$(whiptail --title "$_tui_title - subscriptions" \
+        --menu "V2Ray soft-sub subscriptions" 16 "$_tui_W" 5 \
+        "add"    "Add a subscription URL (fetch its servers)" \
+        "update" "Update a subscription (refresh server list)" \
+        "list"   "List subscriptions" \
+        "remove" "Remove a subscription + its servers" \
+        "back"   "Back" \
+        3>&1 1>&2 2>&3)" || return 0
+    case "$choice" in
+        add)    _tui_sub_add ;;
+        update) _tui_sub_pick update ;;
+        list)   _tui_sub_list ;;
+        remove) _tui_sub_pick remove ;;
+    esac
+}
+
+_tui_sub_add() {
+    local url name
+    url="$(whiptail --title "$_tui_title - add subscription" \
+        --inputbox "Subscription URL (http:// or https://):" \
+        10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$url" ]] || return 0
+    name="$(whiptail --title "$_tui_title - add subscription" \
+        --inputbox "Name (leave empty to derive from the URL host):" \
+        10 "$_tui_W" 3>&1 1>&2 2>&3)" || return 0
+    _tui_sub_run "adding subscription" add "$url" "$name"
+}
+
+_tui_sub_list() {
+    local body
+    body="$("$(_subscription_bin)" list 2>&1)"
+    [[ -n "$body" ]] || body="(no subscriptions)"
+    whiptail --title "$_tui_title - subscriptions" --scrolltext --msgbox "$body" 18 "$_tui_W"
+}
+
+# Pick a subscription, then run `update`/`remove` against it.
+_tui_sub_pick() {
+    local action="$1" subs=() entries=() s
+    while IFS= read -r s; do subs+=("$s"); entries+=("$s" ""); done \
+        < <("$(_subscription_bin)" list 2>/dev/null | awk '{print $1}')
+    if (( ${#subs[@]} == 0 )); then
+        whiptail --title "$_tui_title - subscriptions" \
+            --msgbox "No subscriptions yet.\n\nUse 'Add a subscription URL' first." 10 "$_tui_W"
+        return
+    fi
+    local choice
+    if [[ "$action" == update ]]; then
+        entries=( "all" "Update ALL subscriptions" "${entries[@]}" )
+    fi
+    choice="$(whiptail --title "$_tui_title - $action subscription" \
+        --menu "Pick a subscription" 18 "$_tui_W" 10 \
+        "${entries[@]}" 3>&1 1>&2 2>&3)" || return 0
+    [[ -n "$choice" ]] || return 0
+    if [[ "$action" == remove ]]; then
+        whiptail --yesno "Remove subscription '$choice' and delete all of its server profiles?" 10 "$_tui_W" || return 0
+    fi
+    _tui_sub_run "$action subscription" "$action" "$choice"
+}
+
+run_tui() {
+    require_root
+    _check_whiptail
+
+    if ! _health_check; then
+        whiptail --title "$_tui_title - WARNING" --yesno \
+            "State drift detected:\n\n$(printf '%b' "$HEALTH_REPORT")\nReset to direct mode now?" \
+            14 "$_tui_W" \
+            && core_disconnect || true
+    fi
+
+    while true; do
+        local choice
+        choice="$(_tui_main_menu)" || break
+        case "$choice" in
+            connect)    _tui_connect ;;
+            test)       _tui_test ;;
+            disconnect) _tui_disconnect ;;
+            status)     _tui_status ;;
+            logs)       _tui_logs ;;
+            import)     _tui_import ;;
+            subscription) _tui_subscription ;;
+            chain)      _tui_chain ;;
+            manage)     _tui_manage ;;
+            doctor)     _tui_doctor ;;
+            purge)      _tui_purge ;;
+            purge-wg)   _tui_purge_wg ;;
+            quit|"")    break ;;
+        esac
+    done
+    clear
+}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+usage: tunforge [subcommand]
+  (no args)             launch interactive TUI (whiptail)
+  connect <name>        activate a profile
+  disconnect            return to direct connection
+  status                print current status
+  list                  list all profiles
+  test [<name>|all]     ping/TCP-probe each server's endpoint, sort by latency
+                        (cached for 5 min; shown next to entries in the TUI)
+  doctor                health check
+  logs                  tail journald logs (delegates to tunforge-logs)
+  last-log              print transcript of the most recent connect attempt
+  purge                 BIG RED BUTTON: nuke ALL VPN state (WG + OpenVPN + sing-box +
+                        kill switch + DNS overrides + sysctl hardening), restore direct
+  purge-wg              narrower: tear down only WireGuard interfaces + wg-quick policy routing
+  dns-direct            manage the "direct public DNS only" allow-list (regex)
+                          for VPN domains your ISP DNS-poisons; matched hosts
+                          skip NSS fallback entirely
+                          subcommands: list | add <re> | remove <re> | test <host>
+  dns-cache             manage the persistent DNS result cache (host → ip)
+                          subcommands: status | clear | refresh
+  bypass                manage local-dev bypasses while VPN is on
+                          subcommands: list | add <value> | remove <value>
+  openvpn-auth          save/clear OpenVPN username+password per profile
+                          subcommands: status | set <profile> [username] | clear <profile>
+  import <uri> [name]   import a V2Ray URI (vmess|vless|trojan|ss)
+  subscription          manage V2Ray soft-sub subscriptions (fetch a list of
+                          servers from a URL; refresh to update the list)
+                          subcommands: add <url> [name] | update <name>|all |
+                                       list | remove <name>
+  scaffold              create .profile descriptors for any existing configs
+  help                  this message
+
+environment:
+  TUNFORGE_VERBOSE=1     show the per-command detail behind each step (config
+                        paths, individual resolver attempts, routing tables).
+                        Everything is in journald regardless: tunforge logs
+  TUNFORGE_NO_COLOR=1    plain output, no ANSI colour
+EOF
+}
+
+main() {
+    local sub="${1:-}"
+    case "$sub" in
+        ""|tui)        run_tui ;;
+        connect)       require_root; cli_connect "${2:?usage: tunforge connect <profile>}" ;;
+        disconnect)    require_root; cli_disconnect ;;
+        status)        cli_status ;;
+        list|ls)       cli_list ;;
+        doctor)        cli_doctor ;;
+        last-log|last_log) cli_last_log ;;
+        test)          cli_test "${2:-all}" ;;
+        purge)         cli_purge ;;
+        purge-wg|purge_wg) cli_purge_wg ;;
+        dns-direct|dns_direct|dnsd) cli_dns_direct "${@:2}" ;;
+        dns-cache|dns_cache) cli_dns_cache "${@:2}" ;;
+        bypass|local-bypass|local_bypass) cli_bypass "${@:2}" ;;
+        openvpn-auth|ovpn-auth|openvpn_auth|ovpn_auth) cli_openvpn_auth "${@:2}" ;;
+        logs)          exec "${TUNFORGE_PREFIX}/bin/tunforge-logs" "${@:2}" ;;
+        import)        exec "${TUNFORGE_PREFIX}/bin/tunforge-import" "${@:2}" ;;
+        subscription|sub|subscriptions) exec "${TUNFORGE_PREFIX}/bin/tunforge-subscription" "${@:2}" ;;
+        scaffold)      exec "${TUNFORGE_PREFIX}/bin/tunforge-scaffold" "${@:2}" ;;
+        help|-h|--help) usage ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"
