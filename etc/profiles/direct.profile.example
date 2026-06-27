@@ -1,0 +1,6 @@
+# Example: plain direct connection (no VPN). DNS comes from your router via DHCP.
+# Rename to direct.profile to activate.
+TYPE=direct
+DESC="No VPN - router DNS"
+KILL_SWITCH=no
+IPV6=allow
