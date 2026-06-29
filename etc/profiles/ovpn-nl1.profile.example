@@ -1,0 +1,18 @@
+# Example: OpenVPN profile.
+# Rename to ovpn-nl1.profile to activate.
+#
+# Place the corresponding .ovpn at /etc/tunforge/configs/openvpn/ovpn-nl1.ovpn
+
+TYPE=openvpn
+DESC="OpenVPN - Netherlands #1"
+COUNTRY=Netherlands
+CONFIG=/etc/tunforge/configs/openvpn/ovpn-nl1.ovpn
+
+DNS_SERVERS="9.9.9.9 149.112.112.112"
+DNS_OVER_TLS=opportunistic
+KILL_SWITCH=yes
+IPV6=disable
+
+# Optional pinning / MTU
+# ENDPOINT_IP=198.51.100.7
+# MTU=1280

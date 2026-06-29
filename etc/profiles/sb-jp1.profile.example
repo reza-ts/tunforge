@@ -1,0 +1,39 @@
+# Example: sing-box profile (V2Ray-style upstream wrapped in TUN mode).
+# Rename to sb-jp1.profile to activate.
+#
+# Place the corresponding sing-box JSON at
+#   /etc/tunforge/configs/singbox/sb-jp1.json
+#
+# Minimal hand-written example for VMess (use 'sing-box geoip ...' for real ones):
+#
+# {
+#   "outbounds": [
+#     {
+#       "tag": "proxy",
+#       "type": "vmess",
+#       "server": "vmess.example.com",
+#       "server_port": 443,
+#       "uuid": "11111111-2222-3333-4444-555555555555",
+#       "security": "auto",
+#       "tls": { "enabled": true, "server_name": "vmess.example.com" }
+#     }
+#   ]
+# }
+#
+# tunforge auto-injects a TUN inbound, auto_route, strict_route, and a route
+# rule that pins the proxy's server IP to the direct outbound (so your
+# WireGuard-style "tunnel inside tunnel" doesn't loop).
+
+TYPE=singbox
+DESC="V2Ray (sing-box) - Japan #1"
+COUNTRY=Japan
+CONFIG=/etc/tunforge/configs/singbox/sb-jp1.json
+
+DNS_SERVERS="1.1.1.1 9.9.9.9"
+DNS_OVER_TLS=opportunistic
+KILL_SWITCH=yes
+IPV6=disable
+
+# Strongly recommended: pin the proxy server IP so the kill-switch whitelist
+# doesn't depend on local DNS being functional during connect.
+# ENDPOINT_IP=203.0.113.99

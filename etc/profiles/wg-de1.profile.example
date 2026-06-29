@@ -1,0 +1,33 @@
+# Example: WireGuard profile.
+# Rename to wg-de1.profile to activate.
+#
+# Place the corresponding .conf at /etc/tunforge/configs/wireguard/wg-de1.conf
+# Make sure the .conf is chmod 600 (it contains the private key).
+
+TYPE=wireguard
+DESC="WireGuard - Germany #1"
+COUNTRY=Germany
+CONFIG=/etc/tunforge/configs/wireguard/wg-de1.conf
+
+# Custom DNS for THIS profile. Pick servers in the VPN exit country to avoid
+# obvious "VPN in NL but DNS in US" fingerprints.
+# DO NOT use 8.8.8.8 / 8.8.4.4 - they correlate with logged-in Google accounts.
+DNS_SERVERS="1.1.1.1 9.9.9.9"
+
+# Encrypt DNS too (DoT). "opportunistic" tries DoT, falls back to plain;
+# "yes" requires DoT; "off" disables.
+DNS_OVER_TLS=opportunistic
+
+# Hard kill switch: drop all egress that doesn't go through the tunnel.
+KILL_SWITCH=yes
+
+# IPv6 stance: 'disable' = sysctl off (recommended); 'allow' = let it work but
+# the kill switch still drops non-tunnel v6.
+IPV6=disable
+
+# Optional: pin the endpoint IP (skip DNS resolution at connect time). Useful
+# when the country blocks the VPN provider's domain.
+# ENDPOINT_IP=203.0.113.45
+
+# Optional: force MTU (some hostile networks need 1280 to avoid PMTU blackholes).
+# MTU=1280

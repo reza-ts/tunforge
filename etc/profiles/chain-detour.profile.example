@@ -1,0 +1,174 @@
+# ============================================================================
+# Example: CHAINED / MULTI-HOP profile (a.k.a. "double hop", "cascading VPN").
+#
+#   your machine ──► ENTRY server (not yours: v2ray/wireguard) ──► EXIT server
+#                                                                   (YOUR v2ray)
+#                                                                        │
+#                                                                        ▼
+#                                                                     internet
+#
+# Goal: enter through a provider node you DON'T control, then exit through a
+# v2ray server you DO control. Your real public IP only ever talks to the
+# ENTRY node; the ENTRY node only ever sees encrypted traffic to your EXIT.
+#
+# HOW THIS WORKS WITHOUT ANY CHANGES TO tunforge
+# ---------------------------------------------------------------------------
+# sing-box (the engine behind every TYPE=singbox profile) supports a "detour"
+# field on an outbound: it dials that outbound THROUGH another outbound. So the
+# whole chain is expressed inside ONE ordinary sing-box config, run by ONE
+# sing-box process, under the normal tunforge connector. No new profile type,
+# no two fighting tunnels.
+#
+#   outbound "exit"  (your server)  has  "detour": "entry"
+#   outbound "entry" (provider)     dials straight out the physical WAN
+#   route.final = "exit"
+#
+# Packet path: TUN -> exit outbound -> (detour) dialed through entry -> WAN ->
+# entry server -> your exit server -> internet.
+#
+# Rename this file to  chain-detour.profile  to activate it, and put the
+# matching sing-box JSON at:
+#   /etc/tunforge/configs/singbox/chain-detour.json
+# A clean, copy-paste-ready version of that JSON ships next to this file at:
+#   etc/configs/singbox/chain-detour.json.example
+#
+# IMPORTANT: do NOT put comments inside the .json - tunforge validates it with
+# `jq empty` and `jq` rejects comments. Keep all notes here in the .profile.
+# ============================================================================
+#
+# ----------------------------------------------------------------------------
+# ANNOTATED sing-box config (this is the JSON, explained line by line).
+# Copy the comment-free version from chain-detour.json.example, fill in your
+# real values, then:  sing-box check -c /etc/tunforge/configs/singbox/chain-detour.json
+# ----------------------------------------------------------------------------
+#
+# {
+#   "log": { "level": "info", "timestamp": true },
+#
+#   "dns": {
+#     "servers": [
+#       # Resolve DNS at the FAR end of the chain (through "exit") so names are
+#       # looked up from your exit server's vantage point - no DNS leak to the
+#       # entry node or your ISP.
+#       { "tag": "proxy-dns", "type": "udp", "server": "1.1.1.1", "detour": "exit" }
+#     ],
+#     "strategy": "ipv4_only"
+#   },
+#
+#   # tunforge rewrites/forces this TUN inbound anyway (interface_name=tun-opus0,
+#   # auto_route, strict_route). Leaving it here keeps the file self-contained
+#   # and passes `sing-box check` on its own.
+#   "inbounds": [
+#     {
+#       "type": "tun",
+#       "tag": "opus-tun-in",
+#       "interface_name": "tun-opus0",
+#       "address": [ "172.19.0.1/30" ],
+#       "mtu": 9000,
+#       "auto_route": true,
+#       "strict_route": true,
+#       "stack": "system"
+#     }
+#   ],
+#
+#   "outbounds": [
+#     # ---- HOP 2: YOUR exit server. This is the LAST hop before the internet.
+#     # The "detour": "entry" line is the whole trick: sing-box reaches this
+#     # server by first connecting through the "entry" outbound below.
+#     {
+#       "tag": "exit",
+#       "type": "vless",
+#       "server": "YOUR_EXIT_SERVER_IP",         # hardcode the IP (see note A)
+#       "server_port": 443,
+#       "uuid": "EXIT-UUID-HERE",
+#       "tls": {
+#         "enabled": true,
+#         "server_name": "your.exit.example.com", # real SNI / cert name
+#         "utls": { "enabled": true, "fingerprint": "chrome" }
+#       },
+#       "transport": {                            # delete this block if plain TCP
+#         "type": "ws",
+#         "path": "/yourpath",
+#         "headers": { "Host": "your.exit.example.com" }
+#       },
+#       "detour": "entry"
+#     },
+#
+#     # ---- HOP 1: the provider's ENTRY server (the one you do NOT own).
+#     # No "detour" here: this is dialed directly over your physical WAN.
+#     # Replace this whole object with whatever protocol your provider gives
+#     # you (vmess/vless/trojan/ss). A WireGuard entry is also possible via a
+#     # sing-box "wireguard" endpoint - see note C.
+#     {
+#       "tag": "entry",
+#       "type": "vmess",
+#       "server": "PROVIDER_ENTRY_SERVER_IP",     # hardcode the IP (see note A)
+#       "server_port": 443,
+#       "uuid": "ENTRY-UUID-HERE",
+#       "security": "auto",
+#       "tls": { "enabled": true, "server_name": "provider.entry.example.com" }
+#     },
+#
+#     { "tag": "direct", "type": "direct" }
+#   ],
+#
+#   "route": {
+#     "auto_detect_interface": true,
+#     "final": "exit",                            # everything exits via your box
+#     "rules": [
+#       { "action": "sniff" },
+#       { "action": "hijack-dns", "protocol": "dns" },
+#       # CRITICAL: send ONLY the ENTRY server's IP out "direct" (the physical
+#       # WAN) so the entry dial doesn't loop back into the TUN. Do NOT add the
+#       # EXIT IP here - the exit is reached through the entry, never directly.
+#       { "outbound": "direct", "ip_cidr": [ "PROVIDER_ENTRY_SERVER_IP/32" ] }
+#     ]
+#   }
+# }
+#
+# ----------------------------------------------------------------------------
+# Note A - hardcode IPs for a chain. ENDPOINT_IP= (below) only pins ONE host
+#   for the kill switch, but a chain has TWO servers. The robust approach in a
+#   censored network is to put literal IPs in BOTH "server" fields above and
+#   set the real hostname in "tls.server_name". Then connecting needs no DNS at
+#   all. tunforge still resolves+whitelists both server IPs for the kill switch.
+#
+# Note B - kill switch. tunforge auto-extracts every proxy "server" from the
+#   config and whitelists them on the WAN. Whitelisting the exit IP is harmless
+#   (you never send to it directly); whitelisting the entry IP is what lets the
+#   chain's first hop out. Keep KILL_SWITCH=yes.
+#
+# Note C - WireGuard entry. Use the TUI chain wizard ("WireGuard .conf") or
+#   replace the entry hop with a sing-box wireguard endpoint (see
+#   chain-detour.json.example) and keep "detour": "entry" on "exit". Requires
+#   sing-box >= 1.11. Validate with `sing-box check`. (OpenVPN CANNOT be an
+#   entry - sing-box has no OpenVPN outbound.)
+#
+# Note D - MTU. Two layers of encryption shrink the usable MTU. If sites hang
+#   or large downloads stall, set MTU= below (try 1280) and/or lower the TUN
+#   mtu in the JSON.
+# ----------------------------------------------------------------------------
+
+TYPE=singbox
+DESC="Chain: provider-entry -> my v2ray exit"
+COUNTRY=
+
+# The chained sing-box config (comment-free JSON).
+CONFIG=/etc/tunforge/configs/singbox/chain-detour.json
+
+# Pick resolvers in your EXIT country. Never 8.8.8.8 / 8.8.4.4 (they correlate
+# with logged-in Google accounts).
+DNS_SERVERS="1.1.1.1 9.9.9.9"
+DNS_OVER_TLS=opportunistic
+
+# Hard kill switch: drop egress that doesn't go through the tunnel (only the
+# encrypted dial to the ENTRY server is allowed out the physical WAN).
+KILL_SWITCH=yes
+IPV6=disable
+
+# Optional: pin ONE endpoint for the kill switch when DNS is dead at connect
+# time. For a chain, prefer hardcoding both IPs in the JSON (Note A) instead.
+# ENDPOINT_IP=203.0.113.10
+
+# Optional: force a smaller MTU if the double tunnel blackholes large packets.
+# MTU=1280
