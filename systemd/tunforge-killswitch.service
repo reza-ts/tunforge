@@ -1,0 +1,32 @@
+# Installed by tunforge install.sh -> /etc/systemd/system/tunforge-killswitch.service
+#
+# Loads the nftables kill-switch table at boot if /var/lib/tunforge/active points
+# at a non-direct profile. This guarantees that a reboot mid-VPN does not leak
+# even a single packet between boot and the user re-launching the TUI.
+
+[Unit]
+Description=tunforge nftables kill-switch (boot-time enforcement)
+DefaultDependencies=no
+Before=network-pre.target NetworkManager.service systemd-networkd.service
+After=local-fs.target
+Wants=network-pre.target
+ConditionPathExists=/var/lib/tunforge/active
+ConditionFileNotEmpty=/var/lib/tunforge/active
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/tunforge/firewall.sh boot-apply
+ExecStop=/usr/local/lib/tunforge/firewall.sh boot-revert
+
+# Hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tunforge /run
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
