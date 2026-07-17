@@ -1,0 +1,60 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "tag": "proxy-dns", "type": "udp", "server": "1.1.1.1", "detour": "exit" }
+    ],
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "opus-tun-in",
+      "interface_name": "tun-opus0",
+      "address": [ "172.19.0.1/30" ],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "exit",
+      "type": "vless",
+      "server": "YOUR_EXIT_SERVER_IP",
+      "server_port": 443,
+      "uuid": "EXIT-UUID-HERE",
+      "tls": {
+        "enabled": true,
+        "server_name": "your.exit.example.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/yourpath",
+        "headers": { "Host": "your.exit.example.com" }
+      },
+      "detour": "entry"
+    },
+    {
+      "tag": "entry",
+      "type": "vmess",
+      "server": "PROVIDER_ENTRY_SERVER_IP",
+      "server_port": 443,
+      "uuid": "ENTRY-UUID-HERE",
+      "security": "auto",
+      "tls": { "enabled": true, "server_name": "provider.entry.example.com" }
+    },
+    { "tag": "direct", "type": "direct" }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "exit",
+    "rules": [
+      { "action": "sniff" },
+      { "action": "hijack-dns", "protocol": "dns" },
+      { "outbound": "direct", "ip_cidr": [ "PROVIDER_ENTRY_SERVER_IP/32" ] }
+    ]
+  }
+}

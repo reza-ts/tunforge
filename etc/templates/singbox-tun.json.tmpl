@@ -1,0 +1,49 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "vpn-dns",
+        "type": "udp",
+        "server": "__DNS_PRIMARY__",
+        "detour": "proxy"
+      }
+    ],
+    "strategy": "ipv4_only",
+    "disable_cache": false
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "opus-tun-in",
+      "interface_name": "tun-opus0",
+      "address": [ "172.19.0.1/30" ],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "type": "__OUTBOUND_TYPE__",
+      "server": "__SERVER__",
+      "server_port": __SERVER_PORT__
+      __OUTBOUND_EXTRA__
+    },
+    { "tag": "direct", "type": "direct" }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "proxy",
+    "rules": [
+      { "action": "sniff" },
+      { "action": "hijack-dns", "protocol": "dns" },
+      { "outbound": "direct", "ip_cidr": [ "__SERVER_IP__/32" ] }
+    ]
+  }
+}
