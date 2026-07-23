@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Installed by tunforge install.sh -> /etc/NetworkManager/dispatcher.d/50-tunforge-dot
+#
+# Why this exists
+# ---------------
+# systemd-resolved's per-link DNS is runtime state, not configuration. Anything
+# that reconfigures the link - a DHCP lease renewal, `nmcli device reapply`, a
+# reconnect, a reboot - replaces whatever `resolvectl` last set.
+#
+# On a network that blackholes outbound UDP, tunforge moves the LAN link onto
+# DNS-over-TLS (TCP/853) after a teardown, because plain UDP/53 can never
+# answer there. Without this hook that repair would silently evaporate at the
+# next lease renewal and the machine would look like it "randomly" lost DNS.
+#
+# All the logic lives in dns.sh; this is just the trigger. It is a no-op unless
+# tunforge previously recorded a working DoT server AND no VPN is currently up.
+#
+# NetworkManager invokes dispatcher scripts as: <script> <interface> <action>
+# and blocks while they run, so this must stay fast and must never probe the
+# network.
+
+set -o nounset
+
+iface="${1:-}"
+action="${2:-}"
+
+# `up` covers boot and reconnect; the dhcp*-change actions cover lease renewal,
+# which is the one that bites you hours later on an otherwise idle machine.
+case "$action" in
+    up|dhcp4-change|dhcp6-change) ;;
+    *) exit 0 ;;
+esac
+
+[[ -n "$iface" ]] || exit 0
+
+# TUNFORGE_LIB first so a non-default install PREFIX (and the test harness)
+# still finds the right library instead of silently doing nothing.
+for d in ${TUNFORGE_LIB:-} /usr/local/lib/tunforge /usr/lib/tunforge; do
+    if [[ -x "$d/dns.sh" ]]; then
+        exec "$d/dns.sh" dot-reapply "$iface"
+    fi
+done
+
+exit 0
