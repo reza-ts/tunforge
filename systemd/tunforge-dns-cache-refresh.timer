@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh tunforge DNS result cache hourly
+After=network-online.target
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
