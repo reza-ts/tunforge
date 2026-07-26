@@ -1,0 +1,24 @@
+# Installed by tunforge install.sh -> /etc/systemd/system/tunforge@.service
+#
+# Parameterized unit so a profile can be brought up at boot:
+#   sudo systemctl enable --now tunforge@wg-de1
+#
+# The TUI itself does NOT use this unit by default; it invokes the connector
+# scripts directly. The unit exists so power users can wire tunforge into their
+# boot sequence (e.g. always-on VPN).
+
+[Unit]
+Description=tunforge profile %i
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+Requires=tunforge-killswitch.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tunforge connect %i
+ExecStop=/usr/local/bin/tunforge disconnect
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
