@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# tunforge-scaffold - bulk-create profile descriptors for any VPN config files
+# that don't already have one.
+#
+# Looks under:
+#   /etc/tunforge/configs/wireguard/*.conf   -> TYPE=wireguard
+#   /etc/tunforge/configs/openvpn/*.ovpn     -> TYPE=openvpn
+#   /etc/tunforge/configs/openvpn/*.conf     -> TYPE=openvpn
+#   /etc/tunforge/configs/singbox/*.json     -> TYPE=singbox
+#
+# Skips any config whose <basename>.profile already exists.
+
+# shellcheck shell=bash disable=SC2155
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+TUNFORGE_LIB="${TUNFORGE_LIB:-/usr/local/lib/tunforge}"
+# shellcheck disable=SC1091
+source "$TUNFORGE_LIB/core.sh"
+
+DEFAULT_DNS="${TUNFORGE_DEFAULT_DNS:-1.1.1.1 9.9.9.9}"
+DEFAULT_DOT="${TUNFORGE_DEFAULT_DOT:-opportunistic}"
+DEFAULT_KS="${TUNFORGE_DEFAULT_KS:-yes}"
+DEFAULT_V6="${TUNFORGE_DEFAULT_V6:-disable}"
+
+# slugify a filename basename into a profile-safe slug.
+_slug() {
+    local s="$1"
+    s="${s%.*}"  # strip extension
+    s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9._-' '-')"
+    s="${s##-}"; s="${s%%-}"
+    printf '%s' "$s"
+}
+
+_write_profile() {
+    local name="$1" type="$2" cfg="$3" desc="$4"
+    local prof="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+    {
+        printf 'TYPE=%s\n'  "$type"
+        printf 'DESC="%s"\n' "$desc"
+        printf 'CONFIG=%s\n' "$cfg"
+        printf 'DNS_SERVERS="%s"\n' "$DEFAULT_DNS"
+        printf 'DNS_OVER_TLS=%s\n' "$DEFAULT_DOT"
+        printf 'KILL_SWITCH=%s\n' "$DEFAULT_KS"
+        printf 'IPV6=%s\n' "$DEFAULT_V6"
+        printf '# ENDPOINT_IP=  # optional: pin so connect does not need DNS\n'
+        printf '# MTU=          # optional override\n'
+    } > "${prof}.tmp"
+    chmod 0640 "${prof}.tmp"
+    mv -f "${prof}.tmp" "$prof"
+}
+
+scaffold_dir() {
+    # $1=subdir under configs/, $2=TYPE value, rest=glob extensions like 'conf' 'ovpn'
+    local subdir="$1" type="$2"; shift 2
+    local dir="${TUNFORGE_CONFIGS_DIR}/${subdir}"
+    [[ -d "$dir" ]] || return 0
+
+    # Collect matches via a subshell so nullglob doesn't leak / cwd is irrelevant.
+    local matches=()
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && matches+=("$f")
+    done < <(
+        shopt -s nullglob
+        local ext
+        for ext in "$@"; do
+            local g
+            for g in "$dir"/*."$ext"; do
+                printf '%s\n' "$g"
+            done
+        done
+    )
+
+    local base name prof
+    for f in "${matches[@]}"; do
+        [[ -f "$f" ]] || continue
+        base="$(basename "$f")"
+        name="$(_slug "$base")"
+        [[ -n "$name" ]] || continue
+        prof="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+        if [[ -e "$prof" ]]; then
+            log_note "skip $type/$base -> $name (profile already exists)"
+            continue
+        fi
+        _write_profile "$name" "$type" "$f" "$type: $base"
+        log_info "created $prof  ->  $f"
+        printf '%s\n' "$name"
+    done
+}
+
+usage() {
+    cat <<EOF
+tunforge-scaffold - create missing .profile descriptors for existing VPN configs.
+
+Scans:
+  ${TUNFORGE_CONFIGS_DIR}/wireguard/*.conf     -> TYPE=wireguard
+  ${TUNFORGE_CONFIGS_DIR}/openvpn/*.ovpn|conf  -> TYPE=openvpn
+  ${TUNFORGE_CONFIGS_DIR}/singbox/*.json       -> TYPE=singbox
+
+Existing profiles are NEVER touched. Defaults applied:
+  DNS_SERVERS="$DEFAULT_DNS"
+  DNS_OVER_TLS=$DEFAULT_DOT
+  KILL_SWITCH=$DEFAULT_KS
+  IPV6=$DEFAULT_V6
+
+Override via env: TUNFORGE_DEFAULT_DNS, TUNFORGE_DEFAULT_DOT, TUNFORGE_DEFAULT_KS,
+TUNFORGE_DEFAULT_V6.
+
+Usage:
+  sudo tunforge-scaffold
+  sudo tunforge-scaffold --dry-run
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help) usage; exit 0 ;;
+        --dry-run) :; shift; DRY=1 ;;
+    esac
+    require_root
+
+    install -d -m 0750 "$TUNFORGE_PROFILES_DIR"
+
+    if [[ "${DRY:-0}" == 1 ]]; then
+        echo "(dry-run) would scan:"
+        printf '  %s\n  %s\n  %s\n' \
+            "${TUNFORGE_CONFIGS_DIR}/wireguard/*.conf" \
+            "${TUNFORGE_CONFIGS_DIR}/openvpn/*.{ovpn,conf}" \
+            "${TUNFORGE_CONFIGS_DIR}/singbox/*.json"
+        return 0
+    fi
+
+    local created=()
+    local n
+    while IFS= read -r n; do [[ -n "$n" ]] && created+=("$n"); done < <(scaffold_dir wireguard wireguard conf)
+    while IFS= read -r n; do [[ -n "$n" ]] && created+=("$n"); done < <(scaffold_dir openvpn   openvpn   ovpn conf)
+    while IFS= read -r n; do [[ -n "$n" ]] && created+=("$n"); done < <(scaffold_dir singbox   singbox   json)
+
+    if (( ${#created[@]} == 0 )); then
+        echo "no new profiles created (everything already has one, or no configs found)"
+    else
+        echo "created ${#created[@]} profile(s):"
+        printf '  %s\n' "${created[@]}"
+        echo
+        echo "Next: 'sudo tunforge' (TUI) -> Connect to a profile"
+        echo "Edit a profile to tweak DNS / kill-switch with: sudo tunforge (TUI) -> Manage -> Edit"
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

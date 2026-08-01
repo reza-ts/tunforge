@@ -1,0 +1,722 @@
+#!/usr/bin/env bash
+# tunforge-import - convert V2Ray-style URIs into sing-box config + tunforge profile.
+#
+# Supported URI schemes:
+#   vmess://  (base64-encoded JSON payload, the V2RayN dialect)
+#   vless://  (URL-style: vless://uuid@host:port?params#name)
+#   trojan:// (URL-style: trojan://password@host:port?params#name)
+#   ss://     (Shadowsocks, both legacy and SIP002 formats)
+#
+# Output:
+#   /etc/tunforge/configs/singbox/<name>.json    (sing-box config)
+#   /etc/tunforge/profiles/<name>.profile        (tunforge profile, if absent)
+#
+# After running you should be able to: sudo tunforge connect <name>
+
+# shellcheck shell=bash disable=SC2155
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+TUNFORGE_LIB="${TUNFORGE_LIB:-/usr/local/lib/tunforge}"
+# shellcheck disable=SC1091
+source "$TUNFORGE_LIB/core.sh"
+
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+# Decode percent-encoded bytes. ASCII only; sufficient for query-string params
+# and trojan/vless passwords.
+urldecode() {
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+
+# Base64 decode tolerant of missing padding and URL-safe alphabet (-_).
+b64d() {
+    local s="$1"
+    # URL-safe -> standard
+    s="${s//-/+}"
+    s="${s//_/\/}"
+    # pad to multiple of 4
+    local m=$(( ${#s} % 4 ))
+    if (( m == 2 )); then s="${s}=="
+    elif (( m == 3 )); then s="${s}="
+    fi
+    printf '%s' "$s" | base64 -d 2>/dev/null || true
+}
+
+# Split "host:port" honoring [v6]:port form.
+split_hostport() {
+    local hp="$1"
+    if [[ "$hp" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+        printf '%s\n%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        printf '%s\n%s\n' "${hp%:*}" "${hp##*:}"
+    fi
+}
+
+# Get a query-string param (already-decoded value).
+qparam() {
+    local qs="$1" key="$2"
+    local v kv
+    # NOTE: `|| [[ -n "$kv" ]]` is required so the LAST param is not dropped -
+    # `tr` emits no trailing newline, so the final read returns non-zero even
+    # though it populated $kv.
+    while IFS= read -r kv || [[ -n "$kv" ]]; do
+        [[ -z "$kv" ]] && continue
+        if [[ "${kv%%=*}" == "$key" ]]; then
+            v="${kv#*=}"
+            urldecode "$v"
+            return 0
+        fi
+    done < <(printf '%s' "$qs" | tr '&' '\n')
+    return 1
+}
+
+# Suggest a slug for the profile name from a label.
+slugify() {
+    local s="$1"
+    s="$(urldecode "$s")"
+    # ascii lowercase, replace runs of non-[a-z0-9._-] with single dash
+    s="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9._-' '-')"
+    s="${s##-}"; s="${s%%-}"
+    [[ -n "$s" ]] || s="imported-$$"
+    printf '%s' "$s"
+}
+
+# ---------------------------------------------------------------------------
+# Parsers - each emits a JSON envelope on stdout:
+#   { "label": "human label", "server": "host", "outbound": { ... sing-box ... } }
+# Subshell-safe (no shared globals), so they're usable from $(...).
+# ---------------------------------------------------------------------------
+
+# Wrap an outbound into the parser envelope.
+# (Note: avoiding the jq reserved word `label`, hence `note`.)
+_envelope() {
+    local note="$1" server="$2" outbound="$3"
+    jq -n --arg note "$note" --arg server "$server" --argjson outbound "$outbound" \
+        '{note: $note, server: $server, outbound: $outbound}'
+}
+
+# Read "Key = value" from a wg-quick .conf (first match wins).
+_wg_conf_get() {
+    local conf="$1" key="$2"
+    # Split on the FIRST '=' only — WireGuard keys are base64 and often end with '='.
+    awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            eq = index($0, "=")
+            v = substr($0, eq + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", v)
+            print v
+            exit
+        }
+    ' "$conf"
+}
+
+# Turn comma-separated CIDRs into a JSON string array, dropping IPv6 entries.
+_wg_ipv4_addrs_json() {
+    local raw="$1"
+    jq -Rn --arg raw "$raw" '
+        ($raw | gsub(" "; "") | split(",") | map(select(test(":") | not)) | map(select(. != "")))
+    '
+}
+
+parse_wg_conf() {
+    local conf="$1"
+    [[ -f "$conf" && -r "$conf" ]] || die "wireguard conf: not a readable file: $conf"
+
+    local priv pub endpoint psk addr_raw allowed mtu host port note
+    priv="$(_wg_conf_get "$conf" PrivateKey)"
+    pub="$(_wg_conf_get "$conf" PublicKey)"
+    endpoint="$(_wg_conf_get "$conf" Endpoint)"
+    psk="$(_wg_conf_get "$conf" PresharedKey)"
+    addr_raw="$(_wg_conf_get "$conf" Address)"
+    allowed="$(_wg_conf_get "$conf" AllowedIPs)"
+    mtu="$(_wg_conf_get "$conf" MTU)"
+
+    [[ -n "$priv" ]] || die "wireguard conf: missing PrivateKey"
+    [[ -n "$pub"    ]] || die "wireguard conf: missing PublicKey (in [Peer])"
+    [[ -n "$endpoint" ]] || die "wireguard conf: missing Endpoint"
+
+    { read -r host; read -r port; } < <(split_hostport "$endpoint")
+    [[ -n "$host" && -n "$port" ]] || die "wireguard conf: invalid Endpoint (want host:port)"
+
+    local local_addrs allowed_ips
+    local_addrs="$(_wg_ipv4_addrs_json "${addr_raw:-10.0.0.2/32}")"
+    if [[ "$local_addrs" == "[]" || "$local_addrs" == "null" ]]; then
+        die "wireguard conf: Address has no IPv4 prefix (IPv6-only configs are not supported here)"
+    fi
+    allowed_ips="$(_wg_ipv4_addrs_json "${allowed:-0.0.0.0/0}")"
+    if [[ "$allowed_ips" == "[]" || "$allowed_ips" == "null" ]]; then
+        die "wireguard conf: AllowedIPs has no IPv4 prefix (IPv6-only routes are not supported here)"
+    fi
+
+    note="$(basename "$conf")"
+    note="${note%.conf}"
+
+    # sing-box >= 1.11: WireGuard is an "endpoint", not a legacy outbound
+    # (1.13 rejects outbound.server on type wireguard). The chain wizard and
+    # connector expect this shape; exit hops still use outbounds + detour: entry.
+    local endpoint
+    endpoint="$(jq -n \
+        --arg port "$port" \
+        --arg priv "$priv" \
+        --arg pub "$pub" \
+        --arg psk "$psk" \
+        --arg mtu "$mtu" \
+        --arg peer_host "$host" \
+        --argjson address "$local_addrs" \
+        --argjson allowed_ips "$allowed_ips" \
+    '
+    def nz(s): if (s|type)=="string" and s != "" then s else null end;
+    {
+        tag: "proxy",
+        type: "wireguard",
+        address: $address,
+        private_key: $priv,
+        mtu: (if ($mtu|length) > 0 then ($mtu|tonumber) else null end),
+        peers: [{
+            address: $peer_host,
+            port: ($port | tonumber),
+            public_key: $pub,
+            pre_shared_key: nz($psk),
+            allowed_ips: $allowed_ips
+        }]
+    } | with_entries(select(.value != null))
+    ')"
+    jq -n \
+        --arg note "$note" \
+        --arg server "$host" \
+        --argjson endpoint "$endpoint" \
+        '{note: $note, server: $server, hop: "wireguard", endpoint: $endpoint}'
+}
+
+parse_vmess() {
+    local uri="${1#vmess://}"
+    # Some clients append #fragment AFTER the base64. Some don't.
+    local frag=""
+    if [[ "$uri" == *"#"* ]]; then
+        frag="${uri##*#}"
+        uri="${uri%%#*}"
+    fi
+    local payload; payload="$(b64d "$uri")"
+    [[ -n "$payload" ]] || die "vmess: cannot base64-decode payload"
+    jq empty <<<"$payload" >/dev/null 2>&1 || die "vmess: payload is not valid JSON"
+
+    local label server
+    label="${frag:-$(jq -r '.ps // ""' <<<"$payload")}"
+    server="$(jq -r '.add' <<<"$payload")"
+
+    # Map V2RayN's vmess JSON to sing-box's vmess outbound
+    local outbound
+    outbound="$(jq --arg tag proxy '
+        def to_int(s): if (s|type)=="number" then s else (s|tonumber) end;
+        . as $v |
+        {
+            tag: $tag,
+            type: "vmess",
+            server: $v.add,
+            server_port: (to_int($v.port)),
+            uuid: $v.id,
+            security: ($v.scy // "auto"),
+            alter_id: (to_int(($v.aid // "0"))),
+            transport: (
+                ($v.net // "tcp") as $net |
+                if   $net == "ws" then {
+                    type: "ws",
+                    path: ($v.path // "/"),
+                    headers: (if (($v.host // "") != "") then { Host: $v.host } else {} end)
+                }
+                elif $net == "grpc" then {
+                    type: "grpc",
+                    service_name: ($v.path // ($v.host // ""))
+                }
+                elif $net == "h2" or $net == "http" then {
+                    type: "http",
+                    host: (if (($v.host // "") != "") then [$v.host] else [] end),
+                    path: ($v.path // "/")
+                }
+                else null end
+            ),
+            tls: (
+                if (($v.tls // "") | ascii_downcase | IN("tls","reality")) then {
+                    enabled: true,
+                    server_name: (
+                        ($v.sni // "") as $s |
+                        if $s != "" then $s
+                        elif (($v.host // "") != "") then $v.host
+                        else $v.add end
+                    ),
+                    insecure: (($v.allowInsecure // "false") | tostring | ascii_downcase | IN("true","1"))
+                }                 else null end
+            )
+        }
+        | with_entries(select(.value != null))
+    ' <<<"$payload")"
+    _envelope "$label" "$server" "$outbound"
+}
+
+parse_vless() {
+    # vless://uuid@host:port?params#fragment
+    local rest="${1#vless://}"
+    local frag=""
+    if [[ "$rest" == *"#"* ]]; then frag="${rest##*#}"; rest="${rest%%#*}"; fi
+    local qs=""
+    if [[ "$rest" == *"?"* ]]; then qs="${rest##*\?}"; rest="${rest%%\?*}"; fi
+    [[ "$rest" == *"@"* ]] || die "vless: missing @ separating uuid and host"
+    local uuid="${rest%%@*}"
+    local hp="${rest##*@}"
+    local host port
+    { read -r host; read -r port; } < <(split_hostport "$hp")
+    [[ -n "$host" && -n "$port" ]] || die "vless: invalid host:port"
+
+    local network security sni path ws_host service_name flow public_key short_id fp encryption pkt_enc
+    network="$(qparam "$qs" type 2>/dev/null || echo tcp)"
+    security="$(qparam "$qs" security 2>/dev/null || echo none)"
+    sni="$(qparam "$qs" sni 2>/dev/null || echo "")"
+    path="$(qparam "$qs" path 2>/dev/null || echo "/")"
+    ws_host="$(qparam "$qs" host 2>/dev/null || echo "")"
+    service_name="$(qparam "$qs" serviceName 2>/dev/null || qparam "$qs" servicename 2>/dev/null || echo "")"
+    flow="$(qparam "$qs" flow 2>/dev/null || echo "")"
+    public_key="$(qparam "$qs" pbk 2>/dev/null || echo "")"
+    short_id="$(qparam "$qs" sid 2>/dev/null || echo "")"
+    fp="$(qparam "$qs" fp 2>/dev/null || echo "chrome")"
+    encryption="$(qparam "$qs" encryption 2>/dev/null || echo none)"
+    # UDP packet encoding. Only honor it if the URI explicitly asks for it:
+    # hardcoding "xudp" breaks UDP (hence ALL DNS) on servers that don't speak
+    # it, with "unexpected frame: 0". Omitting it = native VLESS UDP, which is
+    # the most broadly compatible across xray / v2ray / sing-box servers.
+    pkt_enc="$(qparam "$qs" packetEncoding 2>/dev/null || qparam "$qs" packet_encoding 2>/dev/null || echo "")"
+
+    local outbound
+    outbound="$(jq -n \
+        --arg server "$host" --arg port "$port" --arg uuid "$uuid" \
+        --arg network "$network" --arg security "$security" \
+        --arg sni "$sni" --arg path "$path" --arg ws_host "$ws_host" \
+        --arg service_name "$service_name" --arg flow "$flow" \
+        --arg pbk "$public_key" --arg sid "$short_id" --arg fp "$fp" \
+        --arg encryption "$encryption" \
+        --arg pkt "$pkt_enc" \
+    '
+    def nz(s): if (s|type)=="string" and s != "" then s else null end;
+    {
+        tag: "proxy",
+        type: "vless",
+        server: $server,
+        server_port: ($port | tonumber),
+        uuid: $uuid,
+        flow: nz($flow),
+        packet_encoding: nz($pkt),
+        transport: (
+            if $network == "ws" then {
+                type: "ws",
+                path: (if $path != "" then $path else "/" end),
+                headers: (if $ws_host != "" then { Host: $ws_host } else {} end)
+            }
+            elif $network == "grpc" then {
+                type: "grpc",
+                service_name: $service_name
+            }
+            elif $network == "http" or $network == "h2" then {
+                type: "http",
+                host: (if $ws_host != "" then [$ws_host] else [] end),
+                path: (if $path != "" then $path else "/" end)
+            }
+            else null end
+        ),
+        tls: (
+            if ($security == "tls" or $security == "reality") then ({
+                enabled: true,
+                server_name: (if $sni != "" then $sni elif $ws_host != "" then $ws_host else $server end),
+                utls: { enabled: true, fingerprint: $fp }
+            } + (if $security == "reality" then {
+                reality: { enabled: true, public_key: $pbk, short_id: $sid }
+            } else {} end))
+            else null end
+        )
+    } | with_entries(select(.value != null))
+    ')"
+    _envelope "$frag" "$host" "$outbound"
+}
+
+parse_trojan() {
+    # trojan://password@host:port?params#fragment
+    local rest="${1#trojan://}"
+    local frag=""
+    if [[ "$rest" == *"#"* ]]; then frag="${rest##*#}"; rest="${rest%%#*}"; fi
+    local qs=""
+    if [[ "$rest" == *"?"* ]]; then qs="${rest##*\?}"; rest="${rest%%\?*}"; fi
+    [[ "$rest" == *"@"* ]] || die "trojan: missing @"
+    local pw="${rest%%@*}"
+    pw="$(urldecode "$pw")"
+    local hp="${rest##*@}"
+    local host port
+    { read -r host; read -r port; } < <(split_hostport "$hp")
+
+    local sni network path ws_host service_name fp
+    sni="$(qparam "$qs" sni 2>/dev/null || qparam "$qs" peer 2>/dev/null || echo "$host")"
+    network="$(qparam "$qs" type 2>/dev/null || echo tcp)"
+    path="$(qparam "$qs" path 2>/dev/null || echo "/")"
+    ws_host="$(qparam "$qs" host 2>/dev/null || echo "")"
+    service_name="$(qparam "$qs" serviceName 2>/dev/null || qparam "$qs" servicename 2>/dev/null || echo "")"
+    fp="$(qparam "$qs" fp 2>/dev/null || echo chrome)"
+
+    local outbound
+    outbound="$(jq -n \
+        --arg server "$host" --arg port "$port" --arg pw "$pw" \
+        --arg network "$network" --arg sni "$sni" \
+        --arg path "$path" --arg ws_host "$ws_host" \
+        --arg service_name "$service_name" --arg fp "$fp" \
+    '
+    {
+        tag: "proxy",
+        type: "trojan",
+        server: $server,
+        server_port: ($port | tonumber),
+        password: $pw,
+        transport: (
+            if $network == "ws" then {
+                type: "ws",
+                path: (if $path != "" then $path else "/" end),
+                headers: (if $ws_host != "" then { Host: $ws_host } else {} end)
+            }
+            elif $network == "grpc" then {
+                type: "grpc",
+                service_name: $service_name
+            }
+            else null end
+        ),
+        tls: {
+            enabled: true,
+            server_name: $sni,
+            utls: { enabled: true, fingerprint: $fp }
+        }
+    } | with_entries(select(.value != null))
+    ')"
+    _envelope "$frag" "$host" "$outbound"
+}
+
+parse_ss() {
+    # Two formats:
+    #   ss://base64(method:password)@host:port#name           (legacy)
+    #   ss://base64(method:password@host:port)#name           (also legacy)
+    #   ss://base64url(method:password):password@host:port    (SIP002 weird)
+    #   ss://method:password@host:port?plugin=...#name        (SIP002 plain)
+    local rest="${1#ss://}"
+    local frag=""
+    if [[ "$rest" == *"#"* ]]; then frag="${rest##*#}"; rest="${rest%%#*}"; fi
+    local qs=""
+    if [[ "$rest" == *"?"* ]]; then qs="${rest##*\?}"; rest="${rest%%\?*}"; fi
+
+    local method="" password="" host="" port=""
+
+    if [[ "$rest" == *"@"* ]]; then
+        # SIP002 form. Userinfo may itself be base64.
+        local userinfo="${rest%%@*}"
+        local hp="${rest##*@}"
+        local decoded; decoded="$(b64d "$userinfo")"
+        if [[ -n "$decoded" && "$decoded" == *":"* ]]; then
+            method="${decoded%%:*}"
+            password="${decoded#*:}"
+        elif [[ "$userinfo" == *":"* ]]; then
+            method="${userinfo%%:*}"
+            password="$(urldecode "${userinfo#*:}")"
+        else
+            die "ss: cannot parse userinfo"
+        fi
+        { read -r host; read -r port; } < <(split_hostport "$hp")
+    else
+        # Legacy: whole thing (minus fragment) is base64 of method:password@host:port
+        local decoded; decoded="$(b64d "$rest")"
+        [[ -n "$decoded" && "$decoded" == *"@"* && "$decoded" == *":"* ]] \
+            || die "ss: legacy base64 payload could not be parsed"
+        local left="${decoded%%@*}"
+        local hp="${decoded##*@}"
+        method="${left%%:*}"
+        password="${left#*:}"
+        { read -r host; read -r port; } < <(split_hostport "$hp")
+    fi
+
+    [[ -n "$method" && -n "$password" && -n "$host" && -n "$port" ]] \
+        || die "ss: missing method/password/host/port"
+
+    local outbound
+    outbound="$(jq -n \
+        --arg server "$host" --arg port "$port" \
+        --arg method "$method" --arg password "$password" \
+    '
+    {
+        tag: "proxy",
+        type: "shadowsocks",
+        server: $server,
+        server_port: ($port | tonumber),
+        method: $method,
+        password: $password
+    }
+    ')"
+    _envelope "$frag" "$host" "$outbound"
+}
+
+# ---------------------------------------------------------------------------
+# Renderer - wraps an outbound JSON into a complete sing-box config
+# ---------------------------------------------------------------------------
+# Args: <outbound-json> <server-ip-or-host>
+# Emits: full sing-box config on stdout
+render_singbox_config() {
+    local outbound_json="$1" server="$2"
+
+    # Resolve server to an IP for the route exception (so the proxy traffic
+    # itself doesn't loop into the TUN).
+    local server_ip="$server"
+    if [[ ! "$server" =~ ^[0-9.]+$ ]]; then
+        local ip
+        ip="$(resolve_endpoint_ipv4 "$server" | head -n1)"
+        [[ -n "$ip" ]] && server_ip="$ip"
+    fi
+
+    # Schema follows sing-box >= 1.12 (legacy DNS server format is removed in
+    # 1.13). Notes:
+    #   - `dns.servers[].type=udp + server=<ip>` is the new format.
+    #   - DNS hijack is done via a route rule with action=hijack-dns instead of
+    #     a `dns` outbound.
+    #   - `sniff` moved to a route rule with action=sniff.
+    jq -n \
+        --argjson outbound "$outbound_json" \
+        --arg server_ip "$server_ip" \
+    '
+    {
+        log: { level: "info", timestamp: true },
+        dns: {
+            servers: [
+                { tag: "proxy-dns", type: "udp", server: "1.1.1.1", detour: "proxy" }
+            ],
+            strategy: "ipv4_only"
+        },
+        inbounds: [
+            {
+                type: "tun",
+                tag: "opus-tun-in",
+                interface_name: "tun-opus0",
+                address: [ "172.19.0.1/30" ],
+                mtu: 9000,
+                auto_route: true,
+                strict_route: true,
+                stack: "system"
+            }
+        ],
+        outbounds: [
+            $outbound,
+            { tag: "direct", type: "direct" }
+        ],
+        route: {
+            auto_detect_interface: true,
+            final: "proxy",
+            rules: [
+                { action: "sniff" },
+                { action: "hijack-dns", protocol: "dns" },
+                { ip_cidr: [ ($server_ip + "/32") ], outbound: "direct" }
+            ]
+        }
+    }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline - parse one URI, write config + profile
+# ---------------------------------------------------------------------------
+
+import_uri() {
+    local uri="$1"
+    local override_name="${2:-}"
+    # Optional tagging, used by tunforge-subscription so generated profiles can
+    # be traced back to (and refreshed/removed with) their subscription:
+    #   TUNFORGE_IMPORT_SOURCE  -> written as SOURCE=<name> in the profile
+    #   TUNFORGE_IMPORT_PREFIX  -> prepended to the derived profile name so a
+    #                            subscription's servers share a namespace and
+    #                            never collide with hand-imported profiles
+    #   TUNFORGE_IMPORT_NAME    -> force the exact profile name, independent of
+    #                            the URI label (the label still feeds DESC).
+    #                            Used for short, stable names like <sub>-01.
+    local source_tag="${TUNFORGE_IMPORT_SOURCE:-}"
+    local name_prefix="${TUNFORGE_IMPORT_PREFIX:-}"
+    local forced_name="${TUNFORGE_IMPORT_NAME:-}"
+    uri="${uri#"${uri%%[![:space:]]*}"}"   # ltrim
+    uri="${uri%"${uri##*[![:space:]]}"}"   # rtrim
+
+    local scheme envelope
+    case "$uri" in
+        vmess://*)  scheme=vmess ;  envelope="$(parse_vmess  "$uri")" ;;
+        vless://*)  scheme=vless ;  envelope="$(parse_vless  "$uri")" ;;
+        trojan://*) scheme=trojan ; envelope="$(parse_trojan "$uri")" ;;
+        ss://*)     scheme=ss ;     envelope="$(parse_ss     "$uri")" ;;
+        *) die "unsupported URI scheme: ${uri%%://*}:// (supported: vmess, vless, trojan, ss)" ;;
+    esac
+
+    [[ -n "$envelope" ]] || die "$scheme: parser produced no output"
+    jq empty <<<"$envelope" >/dev/null 2>&1 || die "$scheme: parser produced invalid JSON"
+
+    local server label outbound
+    server="$(jq -r '.server' <<<"$envelope")"
+    label="$(jq -r '.note' <<<"$envelope")"
+    outbound="$(jq -c '.outbound' <<<"$envelope")"
+
+    [[ -n "$server" && "$server" != "null" ]] || die "$scheme: empty server"
+
+    [[ -n "$override_name" ]] && label="$override_name"
+    [[ -n "$label" && "$label" != "null" ]] || label="${scheme}-${server}"
+    local name; name="$(slugify "$label")"
+    [[ -n "$name_prefix" ]] && name="${name_prefix}${name}"
+    [[ -n "$forced_name" ]] && name="$(slugify "$forced_name")"
+
+    local conf="${TUNFORGE_CONFIGS_DIR}/singbox/${name}.json"
+    local prof="${TUNFORGE_PROFILES_DIR}/${name}.profile"
+
+    install -d -m 0750 "${TUNFORGE_CONFIGS_DIR}/singbox" "$TUNFORGE_PROFILES_DIR"
+
+    log_info "import: $scheme -> $name (server=$server)"
+
+    # Render full config and validate with sing-box if available
+    local cfg; cfg="$(render_singbox_config "$outbound" "$server")"
+    printf '%s\n' "$cfg" > "${conf}.tmp"
+    chmod 0640 "${conf}.tmp"
+    if command -v sing-box >/dev/null 2>&1; then
+        if ! sing-box check -c "${conf}.tmp" >/dev/null 2>&1; then
+            log_warn "import: sing-box check reported issues; saving anyway. Run 'sing-box check -c $conf' to inspect."
+        fi
+    fi
+    mv -f "${conf}.tmp" "$conf"
+    log_info "wrote $conf"
+
+    # Write a profile descriptor only if absent (don't clobber user edits)
+    if [[ ! -e "$prof" ]]; then
+        local server_ip
+        server_ip="$(resolve_endpoint_ipv4 "$server" | head -n1 || true)"
+        {
+            printf 'TYPE=singbox\n'
+            if [[ -n "$source_tag" ]]; then
+                printf 'DESC="%s (sub: %s)"\n' "$label" "$source_tag"
+            else
+                printf 'DESC="imported %s: %s"\n' "$scheme" "$label"
+            fi
+            printf 'CONFIG=%s\n' "$conf"
+            printf 'DNS_SERVERS="1.1.1.1 9.9.9.9"\n'
+            printf 'DNS_OVER_TLS=opportunistic\n'
+            printf 'KILL_SWITCH=yes\n'
+            printf 'IPV6=disable\n'
+            [[ -n "$server_ip" ]] && printf 'ENDPOINT_IP=%s\n' "$server_ip"
+            [[ -n "$source_tag" ]] && printf 'SOURCE=%s\n' "$source_tag"
+        } > "${prof}.tmp"
+        chmod 0640 "${prof}.tmp"
+        mv -f "${prof}.tmp" "$prof"
+        log_info "wrote $prof"
+    else
+        log_note "profile $prof already exists; left untouched"
+    fi
+
+    printf '%s\n' "$name"
+}
+
+# Parse a single URI and print the parser envelope ({note, server, outbound})
+# to stdout WITHOUT writing any files or requiring root. Used by the TUI
+# chaining wizard so each hop can be entered as a URI and converted into a
+# sing-box outbound with the EXACT transport/TLS params (no hand-typing).
+emit_uri() {
+    local uri="$1"
+    uri="${uri#"${uri%%[![:space:]]*}"}"   # ltrim
+    uri="${uri%"${uri##*[![:space:]]}"}"   # rtrim
+    case "$uri" in
+        vmess://*)  parse_vmess  "$uri" ;;
+        vless://*)  parse_vless  "$uri" ;;
+        trojan://*) parse_trojan "$uri" ;;
+        ss://*)     parse_ss     "$uri" ;;
+        *) die "unsupported URI scheme: ${uri%%://*}:// (supported: vmess, vless, trojan, ss)" ;;
+    esac
+}
+
+# Parse a wg-quick .conf and print the same envelope as --emit (no files, no root).
+emit_wgconf() {
+    local conf="$1"
+    conf="${conf#"${conf%%[![:space:]]*}"}"
+    conf="${conf%"${conf##*[![:space:]]}"}"
+    [[ -n "$conf" ]] || die "usage: tunforge-import --emit-wgconf <path-to.conf>"
+    parse_wg_conf "$conf"
+}
+
+usage() {
+    cat <<EOF
+tunforge-import - convert V2Ray-style URIs into sing-box configs + tunforge profiles.
+
+Usage:
+  tunforge-import <uri> [<profile-name>]
+  tunforge-import -                       # read one URI from stdin
+  tunforge-import -f FILE                 # read URIs from FILE (one per line; '#' = comment)
+  tunforge-import --emit <uri>            # parse URI, print JSON envelope (no root)
+  tunforge-import --emit-wgconf PATH      # parse wg-quick .conf, print envelope (no root)
+
+Supported schemes: vmess://, vless://, trojan://, ss://
+WireGuard: standard wg-quick .conf for --emit-wgconf (used by the chain wizard)
+
+The profile name is derived from the URI's #fragment (the human label clients
+show), unless you pass an explicit second argument. The result is:
+  /etc/tunforge/configs/singbox/<name>.json
+  /etc/tunforge/profiles/<name>.profile
+
+After import, run:
+  sudo tunforge connect <name>
+
+Examples:
+  sudo tunforge-import 'vless://uuid@server:443?security=tls&type=ws&path=/api#JP-Tokyo'
+  sudo tunforge-import 'vmess://eyJ2IjoiMiIsInBzIjoi...'
+  pbpaste | sudo tunforge-import -                  # macOS-style
+  xclip -o -selection clipboard | sudo tunforge-import -
+EOF
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then usage; exit 2; fi
+
+    # Read-only parse mode (no files written, no root needed). Used by the TUI
+    # chaining wizard.
+    case "$1" in
+        --emit|--emit-outbound|emit)
+            emit_uri "${2:?usage: tunforge-import --emit <uri>}"
+            return 0
+            ;;
+        --emit-wgconf|--emit-wg)
+            emit_wgconf "${2:?usage: tunforge-import --emit-wgconf <path-to.conf>}"
+            return 0
+            ;;
+    esac
+
+    require_root
+
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -)
+            local uri; IFS= read -r uri || die "no URI on stdin"
+            import_uri "$uri"
+            ;;
+        -f)
+            [[ -n "${2:-}" ]] || die "-f requires FILE"
+            local count=0 line
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line#"${line%%[![:space:]]*}"}"
+                [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+                import_uri "$line" || log_warn "import failed for: ${line:0:60}..."
+                ((++count))
+            done < "$2"
+            log_info "imported $count URIs from $2"
+            ;;
+        vmess://*|vless://*|trojan://*|ss://*)
+            import_uri "$1" "${2:-}"
+            ;;
+        *) die "first arg should be a vmess://, vless://, trojan:// or ss:// URI (or '-' for stdin, '-f FILE' for batch). See --help." ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

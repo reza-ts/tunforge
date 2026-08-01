@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# tunforge-logs - colorized live tail of all tunforge-related journald logs.
+#
+# Tags watched:
+#   tunforge       - emitted by core.sh / connectors via systemd-cat
+#   wg-quick      - emitted by wg-quick
+#   sing-box      - emitted by sing-box (when started under systemd)
+#   NetworkManager- to spot DNS / route fights
+#   systemd-resolved
+# Plus any unit named tunforge*.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Default: follow indefinitely. Pass --since="-5min" or any journalctl flag
+# through.
+EXTRA_ARGS=("$@")
+
+if ! command -v journalctl >/dev/null 2>&1; then
+    echo "journalctl not available - this tool needs systemd" >&2
+    exit 1
+fi
+
+# Build the identifier filter list.
+ID_ARGS=(
+    -t tunforge
+    -t wg-quick
+    -t wg
+    -t sing-box
+    -t openvpn
+    -t openvpn-tunforge
+    -t NetworkManager
+    -t systemd-resolved
+    --unit 'tunforge*'
+)
+
+# AWK colorizer:
+#   - red on ERR/error/Error/fail/FATAL
+#   - yellow on WARN/warn/Warning
+#   - cyan on the [tunforge ] tag
+#   - dim on systemd-resolved noise
+COLORIZE='
+BEGIN {
+    R="\033[31m"; G="\033[32m"; Y="\033[33m"; B="\033[34m"; C="\033[36m";
+    M="\033[35m"; DIM="\033[2m"; BOLD="\033[1m"; OFF="\033[0m";
+}
+{
+    line=$0;
+    color=OFF;
+    if (line ~ /(ERROR|FATAL|fatal|Error|err:|panic|leak)/) color=R;
+    else if (line ~ /(WARN|warning|Warning|deprecated)/)   color=Y;
+    else if (line ~ /tunforge/)                              color=C;
+    else if (line ~ /wg-quick|wireguard/)                   color=G;
+    else if (line ~ /openvpn/)                              color=M;
+    else if (line ~ /sing-box/)                             color=B;
+    else if (line ~ /systemd-resolved/)                     color=DIM;
+    print color line OFF;
+    fflush();
+}'
+
+if [[ "${TUNFORGE_NO_COLOR:-0}" == "1" ]] || [[ ! -t 1 ]]; then
+    exec journalctl -f --output=short-iso "${ID_ARGS[@]}" "${EXTRA_ARGS[@]}"
+else
+    journalctl -f --output=short-iso "${ID_ARGS[@]}" "${EXTRA_ARGS[@]}" \
+        | awk "$COLORIZE"
+fi

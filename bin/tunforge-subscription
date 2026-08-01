@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# tunforge-subscription - manage V2Ray "soft sub" subscriptions.
+#
+# A subscription is a remote URL that returns a list of V2Ray connection URIs
+# (vmess/vless/trojan/ss), commonly base64-encoded, one per line. Updating a
+# subscription re-fetches that URL and regenerates one sing-box profile per
+# server, so the connection list stays fresh and you can pick any of them to
+# connect from the normal tunforge connect picker.
+#
+# Storage:
+#   /etc/tunforge/subscriptions/<name>.sub          (descriptor: URL + metadata)
+#   /etc/tunforge/profiles/<name>-NN-<label>.profile  (one per server, SOURCE=<name>)
+#   /etc/tunforge/configs/singbox/<...>.json          (underlying sing-box config)
+#
+# Each generated profile carries `SOURCE=<name>` so an update can cleanly
+# remove the previous server set before importing the new one.
+
+# shellcheck shell=bash disable=SC2155
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+TUNFORGE_LIB="${TUNFORGE_LIB:-/usr/local/lib/tunforge}"
+TUNFORGE_PREFIX="${TUNFORGE_PREFIX:-/usr/local}"
+
+# Reuse the URI import pipeline (import_uri, parsers, slugify, b64d). Sourcing
+# tunforge-import also pulls in core.sh; its main() is guarded so nothing runs.
+_self_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+_import_bin="${TUNFORGE_IMPORT_BIN:-$_self_dir/tunforge-import}"
+[[ -r "$_import_bin" ]] || _import_bin="${TUNFORGE_PREFIX}/bin/tunforge-import"
+# shellcheck disable=SC1090
+source "$_import_bin"
+
+# ---------------------------------------------------------------------------
+# Descriptor helpers
+# ---------------------------------------------------------------------------
+_sub_file() { printf '%s/%s.sub\n' "$TUNFORGE_SUBS_DIR" "$1"; }
+
+_valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+
+list_subs() {
+    [[ -d "$TUNFORGE_SUBS_DIR" ]] || return 0
+    find "$TUNFORGE_SUBS_DIR" -maxdepth 1 -type f -name '*.sub' -printf '%f\n' \
+        | sed 's/\.sub$//' | sort
+}
+
+# Parse a .sub descriptor into SUB_* globals.
+SUB_NAME="" SUB_URL="" SUB_DESC="" SUB_LAST_UPDATED="" SUB_COUNT=""
+load_sub() {
+    local name="$1" file; file="$(_sub_file "$name")"
+    [[ -f "$file" ]] || die "subscription not found: $name ($file)"
+    SUB_NAME="$name"; SUB_URL=""; SUB_DESC=""; SUB_LAST_UPDATED=""; SUB_COUNT=""
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ "$line" == *"="* ]] || continue
+        key="${line%%=*}"; value="${line#*=}"
+        if [[ "$value" =~ ^\"(.*)\"$ ]]; then value="${BASH_REMATCH[1]}"
+        elif [[ "$value" =~ ^\'(.*)\'$ ]]; then value="${BASH_REMATCH[1]}"; fi
+        case "$key" in
+            URL)          SUB_URL="$value" ;;
+            DESC)         SUB_DESC="$value" ;;
+            LAST_UPDATED) SUB_LAST_UPDATED="$value" ;;
+            COUNT)        SUB_COUNT="$value" ;;
+        esac
+    done < "$file"
+    [[ -n "$SUB_URL" ]] || die "subscription '$name' has no URL="
+}
+
+# Profiles belonging to a subscription (by SOURCE= tag), one name per line.
+sub_members() {
+    local want="$1" f src
+    [[ -d "$TUNFORGE_PROFILES_DIR" ]] || return 0
+    for f in "$TUNFORGE_PROFILES_DIR"/*.profile; do
+        [[ -e "$f" ]] || continue
+        src="$(awk -F= '/^[[:space:]]*SOURCE[[:space:]]*=/{sub(/^[^=]*=/,"");gsub(/^["'\'' ]+|["'\'' ]+$/,"");print;exit}' "$f" 2>/dev/null)"
+        [[ "$src" == "$want" ]] && basename "$f" .profile
+    done
+}
+
+# Remove a single member profile and its underlying sing-box config.
+_remove_profile() {
+    local name="$1" pf="${TUNFORGE_PROFILES_DIR}/${1}.profile" cfg
+    [[ -f "$pf" ]] || return 0
+    cfg="$(awk -F= '/^[[:space:]]*CONFIG[[:space:]]*=/{sub(/^[^=]*=/,"");gsub(/^["'\'' ]+|["'\'' ]+$/,"");print;exit}' "$pf" 2>/dev/null)"
+    rm -f "$pf"
+    if [[ -n "$cfg" && "$cfg" == "${TUNFORGE_CONFIGS_DIR}/singbox/"* ]]; then
+        rm -f "$cfg"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Fetch + decode
+# ---------------------------------------------------------------------------
+_url_host() {
+    local u="${1#*://}"; u="${u%%/*}"; u="${u##*@}"
+    if [[ "$u" =~ ^\[(.+)\]:?[0-9]*$ ]]; then printf '%s\n' "${BASH_REMATCH[1]}"
+    else printf '%s\n' "${u%%:*}"; fi
+}
+_url_port() {
+    local u="${1#*://}"; u="${u%%/*}"; u="${u##*@}"
+    if [[ "$u" =~ \]:([0-9]+)$ ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; return; fi
+    if [[ "$u" != *\]* && "$u" == *:* ]]; then printf '%s\n' "${u##*:}"; return; fi
+    case "$1" in http://*) printf '80\n' ;; *) printf '443\n' ;; esac
+}
+
+# Fetch the subscription body. Tries a plain request first; if that fails (DNS
+# poisoning is common for these domains), retries with the host pinned to an IP
+# resolved via tunforge's direct public-DNS resolver.
+sub_fetch() {
+    local url="$1" body="" ua="${TUNFORGE_SUB_UA:-tunforge-subscription}"
+    local -a args=( -fsSL --max-time 25 -A "$ua" )
+    if body="$(curl "${args[@]}" "$url" 2>/dev/null)" && [[ -n "$body" ]]; then
+        printf '%s' "$body"; return 0
+    fi
+    local host port ip
+    host="$(_url_host "$url")"; port="$(_url_port "$url")"
+    ip="$(resolve_endpoint_ipv4 "$host" 2>/dev/null | head -n1 || true)"
+    if [[ -n "$ip" ]]; then
+        log_note "subscription: retrying via pinned IP $host -> $ip"
+        if body="$(curl "${args[@]}" --resolve "${host}:${port}:${ip}" "$url" 2>/dev/null)" \
+            && [[ -n "$body" ]]; then
+            printf '%s' "$body"; return 0
+        fi
+    fi
+    return 1
+}
+
+# Turn a raw subscription body into a newline-separated list of URIs. Handles
+# both base64-encoded bodies (the common case) and plain URI-per-line bodies.
+sub_decode() {
+    local body="$1" decoded cleaned
+    # If it already looks like a URI list, use as-is.
+    if [[ "$body" == *"://"* ]]; then printf '%s' "$body"; return 0; fi
+    cleaned="$(printf '%s' "$body" | tr -d '[:space:]')"
+    decoded="$(b64d "$cleaned")"
+    if [[ "$decoded" == *"://"* ]]; then printf '%s\n' "$decoded"; return 0; fi
+    # Fall back to the raw body (let the import step reject junk lines).
+    printf '%s' "$body"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+sub_update() {
+    local name="$1"
+    if [[ "$name" == all ]]; then
+        local any=0 s
+        while IFS= read -r s; do any=1; sub_update "$s" || log_warn "update failed: $s"; done < <(list_subs)
+        (( any )) || log_info "no subscriptions to update"
+        return 0
+    fi
+    load_sub "$name"
+    log_info "subscription '$name': fetching $SUB_URL"
+
+    local body uris
+    body="$(sub_fetch "$SUB_URL")" || die "subscription '$name': failed to fetch $SUB_URL"
+    uris="$(sub_decode "$body")"
+
+    # Collect the candidate URIs first so we don't wipe the existing server set
+    # until we know the fetch produced something usable.
+    local -a list=()
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        case "$line" in
+            vmess://*|vless://*|trojan://*|ss://*) list+=("$line") ;;
+        esac
+    done <<< "$uris"
+
+    (( ${#list[@]} > 0 )) \
+        || die "subscription '$name': no supported URIs found (vmess/vless/trojan/ss)"
+    log_info "subscription '$name': parsed ${#list[@]} server(s)"
+
+    # Warn if the currently-active profile belongs to this subscription; the
+    # live tunnel keeps running off its staged /run config, but the on-disk
+    # profile is about to be regenerated.
+    local active; active="$(state_get_active 2>/dev/null || echo none)"
+
+    # Replace the previous server set.
+    local old
+    while IFS= read -r old; do
+        [[ -n "$old" ]] || continue
+        [[ "$old" == "$active" ]] && log_warn "subscription '$name': refreshing active profile '$old' (stay connected)"
+        _remove_profile "$old"
+    done < <(sub_members "$name")
+
+    local prefix; prefix="$(slugify "$name")"
+    local idx=0 count=0 uri pname
+    for uri in "${list[@]}"; do
+        idx=$(( idx + 1 ))
+        # Short, stable name: <sub>-NN (e.g. myprovider-01). The server's
+        # human label is kept in DESC, so the picker still shows it.
+        pname="$(printf '%s-%02d' "$prefix" "$idx")"
+        if ( TUNFORGE_IMPORT_SOURCE="$name" TUNFORGE_IMPORT_NAME="$pname" \
+                import_uri "$uri" >/dev/null 2>&1 ); then
+            count=$(( count + 1 ))
+        else
+            log_warn "subscription '$name': skipped ${uri:0:48}..."
+        fi
+    done
+
+    _write_sub "$name" "$SUB_URL" "$SUB_DESC" "$count"
+    log_info "subscription '$name': imported $count/${#list[@]} server(s)"
+    printf '%s\n' "$count"
+}
+
+# Read-only: fetch a subscription URL, decode it, and print one line per
+# supported server as: <note><TAB><server><TAB><uri>. Writes no files and needs
+# no root. Used by the chaining wizard so the ENTRY hop can be picked from a
+# subscription instead of a single pasted URI.
+sub_emit_uris() {
+    local url="$1" body uris line env note server found=0
+    body="$(sub_fetch "$url")" || die "failed to fetch subscription: $url"
+    uris="$(sub_decode "$body")"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+        case "$line" in vmess://*|vless://*|trojan://*|ss://*) : ;; *) continue ;; esac
+        found=$(( found + 1 ))
+        if env="$(emit_uri "$line" 2>/dev/null)"; then
+            note="$(jq -r '.note // ""' <<<"$env" 2>/dev/null)"
+            server="$(jq -r '.server // ""' <<<"$env" 2>/dev/null)"
+        else
+            note=""; server=""
+        fi
+        [[ -n "$note" && "$note" != "null" ]] || note="server $found"
+        [[ -n "$server" && "$server" != "null" ]] || server="?"
+        # Strip tabs/newlines from the label so the TSV stays one-line.
+        note="${note//$'\t'/ }"; note="${note//$'\n'/ }"
+        printf '%s\t%s\t%s\n' "$note" "$server" "$line"
+    done <<< "$uris"
+    (( found > 0 )) || die "no supported URIs found in subscription (vmess/vless/trojan/ss)"
+}
+
+_write_sub() {
+    local name="$1" url="$2" desc="$3" count="$4" now file
+    now="$(date +%s)"
+    file="$(_sub_file "$name")"
+    install -d -m 0750 "$TUNFORGE_SUBS_DIR"
+    {
+        printf 'URL=%s\n' "$url"
+        printf 'DESC="%s"\n' "$desc"
+        printf 'LAST_UPDATED=%s\n' "$now"
+        printf 'COUNT=%s\n' "$count"
+    } > "${file}.tmp"
+    chmod 0640 "${file}.tmp"
+    mv -f "${file}.tmp" "$file"
+}
+
+sub_add() {
+    local url="$1" name="${2:-}"
+    [[ "$url" == http://* || "$url" == https://* ]] \
+        || die "subscription URL must start with http:// or https://"
+    if [[ -z "$name" ]]; then
+        name="$(slugify "$(_url_host "$url")")"
+        [[ -n "$name" ]] || name="sub-$$"
+    fi
+    _valid_name "$name" || die "invalid subscription name '$name' (use A-Z a-z 0-9 . _ -)"
+    local file; file="$(_sub_file "$name")"
+    [[ -e "$file" ]] && die "subscription '$name' already exists (use: tunforge subscription update $name)"
+    log_info "subscription '$name': adding $url"
+    _write_sub "$name" "$url" "subscription $name" 0
+    sub_update "$name"
+}
+
+sub_remove() {
+    local name="$1"
+    load_sub "$name"
+    local m removed=0
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        _remove_profile "$m"
+        removed=$(( removed + 1 ))
+    done < <(sub_members "$name")
+    rm -f "$(_sub_file "$name")"
+    log_info "subscription '$name': removed ($removed profile(s) deleted)"
+}
+
+sub_list() {
+    local any=0 name
+    while IFS= read -r name; do
+        any=1
+        load_sub "$name" 2>/dev/null || continue
+        local when="never" n; n="$(sub_members "$name" | grep -c . || true)"
+        if [[ -n "$SUB_LAST_UPDATED" && "$SUB_LAST_UPDATED" =~ ^[0-9]+$ ]]; then
+            when="$(date -d "@$SUB_LAST_UPDATED" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$SUB_LAST_UPDATED")"
+        fi
+        printf '%-20s  %3s servers  updated %-16s  %s\n' "$name" "$n" "$when" "$SUB_URL"
+    done < <(list_subs)
+    (( any )) || echo "(no subscriptions)"
+}
+
+usage() {
+    cat <<EOF
+tunforge-subscription - manage V2Ray soft-sub subscriptions.
+
+Usage:
+  tunforge-subscription add <url> [<name>]   add a subscription and fetch it
+  tunforge-subscription update <name>|all    re-fetch and refresh the server list
+  tunforge-subscription list                 list subscriptions
+  tunforge-subscription remove <name>        delete a subscription + its profiles
+
+A subscription URL returns a list of vmess://, vless://, trojan:// or ss://
+URIs (usually base64-encoded). Each server becomes a profile named
+<name>-NN-<label> that you can connect to from the normal picker.
+
+Examples:
+  sudo tunforge-subscription add https://example.com/sub?token=abc myprovider
+  sudo tunforge-subscription update myprovider
+  sudo tunforge-subscription update all
+  sudo tunforge-subscription remove myprovider
+EOF
+}
+
+main() {
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    case "$1" in
+        -h|--help|help) usage; exit 0 ;;
+        emit|fetch-uris) sub_emit_uris "${2:?usage: tunforge-subscription emit <url>}" ;;
+        add)    require_root; [[ -n "${2:-}" ]] || die "usage: tunforge-subscription add <url> [name]"
+                sub_add "$2" "${3:-}" ;;
+        update|refresh) require_root; sub_update "${2:?usage: tunforge-subscription update <name>|all}" ;;
+        list|ls) sub_list ;;
+        remove|rm|delete|del) require_root; sub_remove "${2:?usage: tunforge-subscription remove <name>}" ;;
+        *) die "unknown subcommand: $1 (try --help)" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
