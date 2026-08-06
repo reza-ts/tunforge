@@ -1477,12 +1477,16 @@ _do_connect() {
 
     if [[ "$P_TYPE" != "direct" ]]; then
         local _ver_rc=0
+        log_step "Post-connect verification for '$name'"
         "${TUNFORGE_LIB}/verify.sh" "$name" || _ver_rc=$?
         if (( _ver_rc != 0 )); then
-            log_fail "Post-connect verification failed - rolling back"
+            log_fail "Post-connect verification failed (rc=$_ver_rc) - rolling back '$name'"
+            log_hint "See the [FAIL] / Verification summary lines above for which checks broke."
+            log_hint "Full connect transcript: tunforge last-log"
             _rollback_connect "$script" "$name"
             exit 1
         fi
+        log_ok "Post-connect verification succeeded for '$name'"
     fi
 
     country_cache_update_for_profile "$name" "$(state_get_iface)" || true
